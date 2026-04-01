@@ -1,0 +1,10 @@
+*.o 
+*.d 
+*.hex 
+*.bin 
+*.map 
+Output/ 
+_build/ 
+*.emProject 
+*.emSession 
+*.jlink 
