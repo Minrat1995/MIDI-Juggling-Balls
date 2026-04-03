@@ -1,17 +1,16 @@
 /**
- * Sensors Module - Multi-sensor interface for juggling ball
- * 
- * Implemented sensors:
- * - LSM6DSOX: 6-axis IMU (accelerometer + gyroscope)
- * - LIS3MDL: 3-axis magnetometer
- * - H3LIS331DL: High-G accelerometer (±400g) with FSR data encoded in lower bits
- * - BMP581: Barometric pressure sensor
- * - 4× FSR: Force-sensitive resistors (encoded into H3LIS331 lower bits)
- * 
- * FSR Encoding (12 bits total):
- * - H3LIS X-axis [3:0]: 4-bit max squeeze intensity (0-15)
- * - H3LIS Y-axis [3:0]: 4-bit FSR contact pattern (which FSRs active)
- * - H3LIS Z-axis [3:0]: 4-bit flags (reserved for future features)
+ * Sensors Module - TX only
+ *
+ * Declares sensor init, read, and status functions.
+ * Data structures (sensor_data_t etc.) are defined in packet_spec.h
+ * which is included here and must stay in sync with rx/packet_spec.h.
+ *
+ * Sensor configuration:
+ *   LSM6DSOX: 416Hz ODR, ±16g accel, ±500dps gyro, BDU enabled
+ *   LIS3MDL:  80Hz ODR, ±4 gauss, continuous mode, BDU enabled
+ *   H3LIS331: 400Hz ODR, ±400g, BDU enabled
+ *   BMP581:   ~218Hz ODR, OSR x4, normal mode, on-chip compensation
+ *   FSR:      4 channels on SAADC Ch1-4, disabled until Phase 3 wiring
  */
 
 #ifndef SENSORS_H
@@ -19,57 +18,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-
-// ============================================================================
-// SENSOR DATA STRUCTURES
-// ============================================================================
-
-/**
- * Combined LSM6DSOX + LIS3MDL 9-axis IMU data (18 bytes)
- * All values are raw 16-bit signed integers from sensors
- */
-typedef struct {
-    int16_t accel[3];      // X, Y, Z accelerometer (LSM6DSOX)
-    int16_t gyro[3];       // X, Y, Z gyroscope (LSM6DSOX)
-    int16_t mag[3];        // X, Y, Z magnetometer (LIS3MDL)
-} __attribute__((packed)) lsm6_lis3_data_t;
-
-/**
- * Complete sensor reading structure (27 bytes total)
- * 
- * NOTE: Packet size reduced from 31 to 27 bytes by encoding FSR data
- * into unused H3LIS331 lower bits
- */
-typedef struct {
-    // H3LIS331 High-G Accelerometer + FSR Data (6 bytes)
-    // Each axis: [15:4] = 12-bit acceleration, [3:0] = FSR/flags data
-    int16_t h3lis_x_fsr_level;     // X-accel + squeeze intensity (0-15)
-    int16_t h3lis_y_fsr_pattern;   // Y-accel + FSR contact pattern (4 bits)
-    int16_t h3lis_z_flags;         // Z-accel + reserved flags (4 bits)
-    
-    lsm6_lis3_data_t imu;          // 9-axis IMU data (18 bytes)
-    uint8_t pressure[3];           // BMP581 pressure, 24-bit (3 bytes)
-} __attribute__((packed)) sensor_data_t;
-
-// Compile-time verification
-_Static_assert(sizeof(sensor_data_t) == 27, "sensor_data_t must be exactly 27 bytes");
-
-// ============================================================================
-// SENSOR STATUS CODES
-// ============================================================================
-
-typedef enum {
-    SENSOR_OK = 0,
-    SENSOR_ERR_I2C_INIT,
-    SENSOR_ERR_LSM6_NOT_FOUND,
-    SENSOR_ERR_LIS3_NOT_FOUND,
-    SENSOR_ERR_LSM6_CONFIG,
-    SENSOR_ERR_LIS3_CONFIG,
-    SENSOR_ERR_H3LIS_NOT_FOUND,
-    SENSOR_ERR_H3LIS_CONFIG,
-    SENSOR_ERR_BMP_NOT_FOUND,
-    SENSOR_ERR_BMP_CONFIG
-} sensor_status_t;
+#include "packet_spec.h"
 
 // ============================================================================
 // SENSOR STATUS BITMASK
@@ -79,80 +28,82 @@ typedef enum {
 #define SENSOR_LIS3_OK      (1 << 1)
 #define SENSOR_H3LIS_OK     (1 << 2)
 #define SENSOR_BMP_OK       (1 << 3)
+// Bits 4-7: FSR1-4, always 0 until Phase 3 wiring
 #define SENSOR_FSR1_OK      (1 << 4)
 #define SENSOR_FSR2_OK      (1 << 5)
 #define SENSOR_FSR3_OK      (1 << 6)
 #define SENSOR_FSR4_OK      (1 << 7)
 
-#define ALL_SENSORS_OK      0x0F
+// All non-FSR sensors working
+#define ALL_CORE_SENSORS_OK 0x0F
+
+// ============================================================================
+// TEMPERATURE SENTINEL
+// ============================================================================
+
+/**
+ * Returned by sensors_read_temperature() when BMP581 is unavailable.
+ * Value -32768 corresponds to -327.68 C, which is physically impossible.
+ * Callers must check for this value before using the result.
+ *
+ * Example:
+ *   int16_t temp = sensors_read_temperature();
+ *   if (temp != SENSORS_TEMP_UNAVAILABLE) { use_temp(temp); }
+ */
+#define SENSORS_TEMP_UNAVAILABLE  ((int16_t)(-32768))
 
 // ============================================================================
 // PUBLIC FUNCTIONS
 // ============================================================================
 
 /**
- * Initialize I2C bus and all sensors
- * 
- * Configures:
- * - LSM6DSOX: 416 Hz ODR, ±16g accel, ±2000dps gyro
- * - LIS3MDL: 80 Hz ODR, ±4 gauss, continuous mode
- * - H3LIS331: 400 Hz ODR, ±400g range, BDU enabled
- * - BMP581: 200 Hz ODR, OSR x4, normal mode
- * - FSR ADC: 10-bit resolution, 4 channels
- * 
- * @return true on success, false if critical sensors (LSM6/LIS3) fail
+ * Initialize I2C bus and all sensors.
+ * LSM6DSOX and LIS3MDL are required — returns false if either is absent.
+ * H3LIS331 and BMP581 are optional — warnings printed but init continues.
+ *
+ * @return true on success, false if LSM6 or LIS3 fails
  */
 bool sensors_init(void);
 
 /**
- * Get detected I2C addresses for debugging
+ * Get detected I2C addresses (for RTT validation at startup).
  */
 void sensors_get_addresses(uint8_t *lsm6, uint8_t *lis3, uint8_t *h3lis, uint8_t *bmp);
 
 /**
- * Read all sensors and encode data
- * 
- * Reads:
- * - LSM6DSOX: Accelerometer and gyroscope
- * - LIS3MDL: Magnetometer
- * - H3LIS331: High-G accelerometer
- * - BMP581: Barometric pressure
- * - FSRs: 4 force sensors (encoded into H3LIS331 lower bits)
- * 
- * FSR encoding:
- * - Finds max FSR value, scales to 0-15 (stored in X-axis lower 4 bits)
- * - Generates contact pattern showing which FSRs active (Y-axis lower 4 bits)
- * - Reserved flags for future features (Z-axis lower 4 bits)
- * 
- * @param data Pointer to sensor_data_t structure to populate
+ * Read all sensors into data structure.
+ * FSR data packed into H3LIS lower 4 bits (zeros until wired).
+ *
+ * @param data Output structure to populate
  */
 void sensors_read(sensor_data_t *data);
 
 /**
- * Test sensor communication
- * 
- * @return true if all initialized sensors respond correctly
+ * Verify sensor communication (WHO_AM_I checks).
+ *
+ * @return true if LSM6 and LIS3 respond correctly
  */
 bool sensors_test(void);
 
 /**
- * Get runtime sensor status bitmask
- * 
- * @return Bitmask where 1 = sensor working, 0 = sensor failed
+ * Runtime sensor status bitmask.
+ * Updated on every sensors_read() call.
+ *
+ * @return Bitmask: 1=working, 0=failed. Bits 4-7 always 0 (FSR not wired).
  */
 uint8_t sensors_get_status_bitmask(void);
 
 /**
- * Get total I2C error count
- * 
- * @return Number of I2C communication errors since boot
+ * Total I2C error count since boot.
  */
 uint16_t sensors_get_i2c_error_count(void);
 
 /**
- * Read temperature from BMP581 sensor
- * 
- * @return Temperature in 0.01°C units (e.g., 2550 = 25.50°C), or 0 if not available
+ * Read BMP581 temperature.
+ *
+ * Returns temperature in 0.01 C units (2550 = 25.50 C).
+ * Returns SENSORS_TEMP_UNAVAILABLE if BMP581 is absent or read fails.
+ * Caller must check for SENSORS_TEMP_UNAVAILABLE before using the result.
  */
 int16_t sensors_read_temperature(void);
 

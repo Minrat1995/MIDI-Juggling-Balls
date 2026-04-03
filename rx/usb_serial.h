@@ -1,7 +1,12 @@
 /**
  * USB Serial Module
- * 
- * Provides USB CDC virtual serial port for streaming sensor data
+ *
+ * Streams raw 86-byte radio_packet_t structs over USB CDC virtual serial port.
+ * Binary format — the C++ decoder parses the struct directly.
+ *
+ * Phase 1 limitation: USB cable must be connected at boot.
+ * Hot-plug (connecting USB after power-on) is not supported in this version.
+ * USB init is non-fatal: RTT validation works fully without USB connected.
  */
 
 #ifndef USB_SERIAL_H
@@ -12,40 +17,40 @@
 #include "radio_rx.h"
 
 /**
- * Initialize USB CDC device
- * 
- * Configures USB as virtual serial port.
- * Will appear as /dev/ttyACM0 (Linux) or COMx (Windows).
- * 
- * @return true on success, false on error
+ * Initialize USB CDC.
+ *
+ * Cable must be connected at boot — hot-plug is not supported in Phase 1.
+ * USB init is non-fatal: RTT validation works fully without USB.
+ *
+ * @return true on success (false does not prevent RTT operation)
  */
 bool usb_serial_init(void);
 
 /**
- * Check if USB is connected and ready
- * 
- * @return true if host connected and port open
+ * Drive the USB event queue. Call from the main loop, every iteration.
+ * Non-blocking; processes pending USB stack events.
+ */
+void usb_serial_process(void);
+
+/**
+ * @return true if host has opened the serial port
  */
 bool usb_serial_ready(void);
 
 /**
- * Send raw packet data over USB
- * 
- * Format: Binary packet structure (98 bytes)
- * Non-blocking: returns immediately if buffer full
- * 
+ * Send one raw packet (86 bytes) over USB.
+ * Non-blocking: returns false if USB not ready or TX buffer full.
+ *
  * @param packet Pointer to packet to send
- * @return true if sent, false if buffer full
+ * @return true if write was accepted
  */
 bool usb_serial_send_packet(const radio_packet_t *packet);
 
 /**
- * Send statistics text over USB
- * 
- * Format: ASCII text (same as RTT output)
- * 
+ * Send a null-terminated ASCII string over USB (for diagnostics).
+ *
  * @param text Null-terminated string
- * @return true if sent, false if buffer full
+ * @return true if write was accepted
  */
 bool usb_serial_send_text(const char *text);
 
