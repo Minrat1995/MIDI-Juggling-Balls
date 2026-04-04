@@ -1,18 +1,21 @@
 /**
  * Sensors Module Implementation
  *
- * Fixes applied in this version:
+ * Fixes applied across review and hardware validation sessions:
  *   - LIS3MDL burst read: | 0x80 on register address (was reading X-low 6x)
- *   - CTRL2_G: 0x64 for ±500dps (was 0x68 = ±1000dps)
+ *   - CTRL2_G: 0x64 for +/-500dps (was 0x68 = +/-1000dps)
  *   - CTRL3_C: BDU + IF_INC enabled on LSM6DSOX (prevents split-sample reads)
  *   - runtime_sensor_status initialised 0x00 (was 0x0F — falsely reported all OK)
  *   - init_bmp581: status/reg_val initialised to 0 (was UB if I2C failed early)
  *   - BMP581 STATUS bit 0 nvm_rdy interpretation corrected (1=ready, not busy)
- *   - init_bmp581 diagnostics use named register constants throughout
+ *   - BMP581 OSR_CONFIG: 0x52 not 0x12 — bit 6 (PRESS_EN) must be set to
+ *     enable pressure measurements. Without it the output registers stay at
+ *     0x7F7F7F indefinitely regardless of other configuration. Confirmed in
+ *     hardware testing: two units failed identically until this was corrected.
+ *   - sensors_read_temperature: returns SENSORS_TEMP_UNAVAILABLE on failure
+ *     instead of 0 (0 is a valid temperature and is ambiguous as an error)
  *   - fsr_init comment corrected: SAADC not yet enabled when fsr_init() runs
  *   - fsr_read: SAADC resolution save/restore scaffolded for Phase 3 wiring
- *   - sensors_read_temperature: returns SENSORS_TEMP_UNAVAILABLE on failure
- *     instead of 0 (0 is valid — 0.00 C — and is ambiguous as an error value)
  */
 
 #include "sensors.h"
@@ -110,15 +113,15 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 static const nrf_drv_twi_t m_twi = NRF_DRV_TWI_INSTANCE(0);
 static bool twi_initialized = false;
 
-static uint8_t lsm6_addr = 0;
-static uint8_t lis3_addr = 0;
+static uint8_t lsm6_addr  = 0;
+static uint8_t lis3_addr  = 0;
 static uint8_t h3lis_addr = 0;
-static uint8_t bmp_addr = 0;
+static uint8_t bmp_addr   = 0;
 
 // Initialised to 0x00: do not report sensors OK before detection runs
-static uint8_t runtime_sensor_status = 0x00;
+static uint8_t  runtime_sensor_status = 0x00;
 static uint16_t i2c_error_count = 0;
-static bool fsr_initialized = false;
+static bool     fsr_initialized  = false;
 
 // ============================================================================
 // LOW-LEVEL I2C
@@ -161,12 +164,12 @@ static void fsr_init(void)
     // Channel config writes are valid before SAADC enable.
     for (int ch = 1; ch <= 4; ch++) {
         NRF_SAADC->CH[ch].CONFIG =
-            (SAADC_CH_CONFIG_RESP_Bypass   << SAADC_CH_CONFIG_RESP_Pos) |
-            (SAADC_CH_CONFIG_RESN_Bypass   << SAADC_CH_CONFIG_RESN_Pos) |
-            (SAADC_CH_CONFIG_GAIN_Gain1_6  << SAADC_CH_CONFIG_GAIN_Pos) |
+            (SAADC_CH_CONFIG_RESP_Bypass     << SAADC_CH_CONFIG_RESP_Pos) |
+            (SAADC_CH_CONFIG_RESN_Bypass     << SAADC_CH_CONFIG_RESN_Pos) |
+            (SAADC_CH_CONFIG_GAIN_Gain1_6    << SAADC_CH_CONFIG_GAIN_Pos) |
             (SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos) |
-            (SAADC_CH_CONFIG_TACQ_10us     << SAADC_CH_CONFIG_TACQ_Pos) |
-            (SAADC_CH_CONFIG_MODE_SE       << SAADC_CH_CONFIG_MODE_Pos);
+            (SAADC_CH_CONFIG_TACQ_10us       << SAADC_CH_CONFIG_TACQ_Pos) |
+            (SAADC_CH_CONFIG_MODE_SE         << SAADC_CH_CONFIG_MODE_Pos);
         NRF_SAADC->CH[ch].PSELN = SAADC_CH_PSELN_PSELN_NC;
     }
     NRF_SAADC->CH[1].PSELP = FSR0_ADC_PIN;
@@ -211,7 +214,7 @@ static bool fsr_read(uint16_t *fsr_out)
     NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_10bit;
 
     int16_t adc_values[4];
-    NRF_SAADC->RESULT.PTR  = (uint32_t)adc_values;
+    NRF_SAADC->RESULT.PTR    = (uint32_t)adc_values;
     NRF_SAADC->RESULT.MAXCNT = 4;
     NRF_SAADC->TASKS_START = 1;
 
@@ -294,13 +297,15 @@ static uint8_t detect_bmp581(void)
     uint8_t chip_id;
     if (i2c_read_reg(BMP581_ADDR_1, BMP_CHIP_ID, &chip_id)) {
         if (chip_id == BMP581_ID || chip_id == BMP581_ID_ALT) {
-            SEGGER_RTT_printf(0, "BMP581 at 0x%02X (CHIP_ID=0x%02X)\r\n", BMP581_ADDR_1, chip_id);
+            SEGGER_RTT_printf(0, "BMP581 at 0x%02X (CHIP_ID=0x%02X)\r\n",
+                BMP581_ADDR_1, chip_id);
             return BMP581_ADDR_1;
         }
     }
     if (i2c_read_reg(BMP581_ADDR_2, BMP_CHIP_ID, &chip_id)) {
         if (chip_id == BMP581_ID || chip_id == BMP581_ID_ALT) {
-            SEGGER_RTT_printf(0, "BMP581 at 0x%02X (CHIP_ID=0x%02X)\r\n", BMP581_ADDR_2, chip_id);
+            SEGGER_RTT_printf(0, "BMP581 at 0x%02X (CHIP_ID=0x%02X)\r\n",
+                BMP581_ADDR_2, chip_id);
             return BMP581_ADDR_2;
         }
     }
@@ -314,7 +319,7 @@ static uint8_t detect_bmp581(void)
 static bool init_bmp581(void)
 {
     // Initialise to 0: safe to print even if I2C reads fail before assignment
-    uint8_t status = 0;
+    uint8_t status  = 0;
     uint8_t reg_val = 0;
 
     SEGGER_RTT_printf(0, "\r\n=== BMP581 Init ===\r\n");
@@ -343,21 +348,31 @@ static bool init_bmp581(void)
 
     // nvm_rdy (bit 0): 1 = NVM subsystem ready (datasheet confirmed)
     // nvm_err (bit 1): 1 = NVM error (calibration load failed)
+    // NOTE: nvm_err has been observed on genuine working Adafruit BMP581
+    // breakouts during hardware testing. It does not prevent correct operation
+    // provided pressure reads return valid data. Do not treat it as fatal.
     SEGGER_RTT_printf(0, "Step 3: STATUS analysis:\r\n");
     SEGGER_RTT_printf(0, "  nvm_rdy=%s nvm_err=%s drdy=%s\r\n",
         (status & 0x01) ? "ready" : "NOT READY",
         (status & 0x02) ? "ERROR" : "ok",
         (status & 0x20) ? "ready" : "not ready");
     if (status & 0x02) {
-        SEGGER_RTT_printf(0, "  WARNING: NVM error — sensor may be defective\r\n");
+        SEGGER_RTT_printf(0, "  WARNING: NVM error flag set (observed on known-good units)\r\n");
     }
 
-    SEGGER_RTT_printf(0, "Step 4: OSR config (pres x4, temp x4)...\r\n");
-    if (!i2c_write_reg(bmp_addr, BMP_OSR_CONFIG, 0x12)) {
+    // OSR_CONFIG = 0x52:
+    //   bit 6 (PRESS_EN) = 1  — MUST be set to enable pressure measurement.
+    //                           Without this bit, output registers stay at
+    //                           0x7F7F7F regardless of all other config.
+    //   bits [4:2] (OSR_T)    = 001 = temperature oversampling x2 (effectively x4 with OSR_P)
+    //   bits [1:0] (OSR_P)    = 10  = pressure oversampling x4
+    // 0x52 = 0101 0010
+    SEGGER_RTT_printf(0, "Step 4: OSR config (PRESS_EN=1, pres x4, temp x4)...\r\n");
+    if (!i2c_write_reg(bmp_addr, BMP_OSR_CONFIG, 0x52)) {
         SEGGER_RTT_printf(0, "  FAILED\r\n"); return false;
     }
     if (i2c_read_reg(bmp_addr, BMP_OSR_CONFIG, &reg_val))
-        SEGGER_RTT_printf(0, "  OSR_CONFIG readback=0x%02X (expect 0x12)\r\n", reg_val);
+        SEGGER_RTT_printf(0, "  OSR_CONFIG readback=0x%02X (expect 0x52)\r\n", reg_val);
     nrf_delay_ms(10);
 
     SEGGER_RTT_printf(0, "Step 5: NORMAL mode (~218Hz)...\r\n");
@@ -386,7 +401,9 @@ static bool init_bmp581(void)
     uint8_t press_data[3];
     for (int attempt = 0; attempt < 5; attempt++) {
         if (i2c_read_regs(bmp_addr, BMP_PRESS_XLSB, press_data, 3)) {
-            uint32_t raw = press_data[0] | (press_data[1] << 8) | (press_data[2] << 16);
+            uint32_t raw = press_data[0] |
+                          (press_data[1] << 8) |
+                          (press_data[2] << 16);
             uint32_t pa  = raw / 64;
             SEGGER_RTT_printf(0, "  [%d] raw=0x%06X = %u Pa\r\n", attempt + 1, raw, pa);
             if (raw != 0x7F7F7F && pa >= 30000 && pa <= 110000) {
@@ -399,7 +416,7 @@ static bool init_bmp581(void)
 
     SEGGER_RTT_printf(0, "=== BMP581 FAILED ===\r\n");
     SEGGER_RTT_printf(0, "All reads returned 0x7F7F7F\r\n");
-    SEGGER_RTT_printf(0, "Possible causes: NVM error, wiring, defective module\r\n\r\n");
+    SEGGER_RTT_printf(0, "Possible causes: PRESS_EN not set (check 0x52), wiring, defective module\r\n\r\n");
     return false;
 }
 
@@ -461,15 +478,15 @@ bool sensors_init(void)
 
     // ---- LSM6DSOX configuration ----
 
-    // CTRL1_XL: 416Hz ODR, ±16g
-    // 0x66 = 0110 0110: ODR[7:4]=0110=416Hz, FS_XL[3:2]=11=±16g
+    // CTRL1_XL: 416Hz ODR, +/-16g
+    // 0x66 = 0110 0110: ODR[7:4]=0110=416Hz, FS_XL[3:2]=11=+/-16g
     if (!i2c_write_reg(lsm6_addr, LSM6_CTRL1_XL, 0x66)) {
         SEGGER_RTT_printf(0, "ERROR: LSM6DSOX CTRL1_XL failed\r\n");
         return false;
     }
 
-    // CTRL2_G: 416Hz ODR, ±500dps
-    // 0x64 = 0110 0100: ODR[7:4]=0110=416Hz, FS_G[3:2]=01=±500dps
+    // CTRL2_G: 416Hz ODR, +/-500dps
+    // 0x64 = 0110 0100: ODR[7:4]=0110=416Hz, FS_G[3:2]=01=+/-500dps
     if (!i2c_write_reg(lsm6_addr, LSM6_CTRL2_G, 0x64)) {
         SEGGER_RTT_printf(0, "ERROR: LSM6DSOX CTRL2_G failed\r\n");
         return false;
@@ -482,7 +499,7 @@ bool sensors_init(void)
         SEGGER_RTT_printf(0, "ERROR: LSM6DSOX CTRL3_C failed\r\n");
         return false;
     }
-    SEGGER_RTT_printf(0, "LSM6DSOX: 416Hz, ±16g, ±500dps, BDU enabled\r\n");
+    SEGGER_RTT_printf(0, "LSM6DSOX: 416Hz, +/-16g, +/-500dps, BDU enabled\r\n");
 
     // ---- LIS3MDL configuration ----
 
@@ -491,7 +508,7 @@ bool sensors_init(void)
         SEGGER_RTT_printf(0, "ERROR: LIS3MDL CTRL_REG1 failed\r\n");
         return false;
     }
-    // CTRL_REG2: ±4 gauss
+    // CTRL_REG2: +/-4 gauss
     if (!i2c_write_reg(lis3_addr, LIS3_CTRL_REG2, 0x00)) {
         SEGGER_RTT_printf(0, "ERROR: LIS3MDL CTRL_REG2 failed\r\n");
         return false;
@@ -506,7 +523,7 @@ bool sensors_init(void)
         SEGGER_RTT_printf(0, "ERROR: LIS3MDL CTRL_REG4 failed\r\n");
         return false;
     }
-    SEGGER_RTT_printf(0, "LIS3MDL: 80Hz, ±4 gauss, continuous\r\n");
+    SEGGER_RTT_printf(0, "LIS3MDL: 80Hz, +/-4 gauss, continuous\r\n");
 
     // ---- H3LIS331 configuration (optional) ----
 
@@ -519,8 +536,8 @@ bool sensors_init(void)
         }
     }
     if (h3lis_addr != 0) {
-        // CTRL_REG4: BDU=1, ±400g, little-endian
-        // 0xB0 = 1011 0000: BDU(bit7)=1, FS[5:4]=11=±400g
+        // CTRL_REG4: BDU=1, +/-400g, little-endian
+        // 0xB0 = 1011 0000: BDU(bit7)=1, FS[5:4]=11=+/-400g
         if (!i2c_write_reg(h3lis_addr, H3LIS_CTRL_REG4, 0xB0)) {
             SEGGER_RTT_printf(0, "WARNING: H3LIS331 CTRL_REG4 failed\r\n");
             h3lis_addr = 0;
@@ -528,7 +545,7 @@ bool sensors_init(void)
         }
     }
     if (h3lis_addr != 0) {
-        SEGGER_RTT_printf(0, "H3LIS331: ±400g, 400Hz, BDU enabled\r\n");
+        SEGGER_RTT_printf(0, "H3LIS331: +/-400g, 400Hz, BDU enabled\r\n");
     }
 
     // ---- BMP581 configuration (optional) ----
@@ -558,8 +575,8 @@ void sensors_get_addresses(uint8_t *lsm6, uint8_t *lis3, uint8_t *h3lis, uint8_t
 
 void sensors_read(sensor_data_t *data)
 {
-    uint8_t raw[6];
-    int16_t h3lis_raw[3];
+    uint8_t  raw[6];
+    int16_t  h3lis_raw[3];
     uint16_t fsr_raw[4];
 
     if (!twi_initialized || lsm6_addr == 0) {
@@ -648,9 +665,9 @@ void sensors_read(sensor_data_t *data)
 
             // Explicit mask before OR: do not rely on sensor hardware guaranteeing
             // zeros in bits [3:0]. The mask makes the packing intention explicit.
-            data->h3lis_x_fsr_level    = (h3lis_raw[0] & (int16_t)0xFFF0) | (int16_t)fsr_intensity;
-            data->h3lis_y_fsr_pattern  = (h3lis_raw[1] & (int16_t)0xFFF0) | (int16_t)fsr_pattern;
-            data->h3lis_z_flags        = (h3lis_raw[2] & (int16_t)0xFFF0) | 0;
+            data->h3lis_x_fsr_level   = (h3lis_raw[0] & (int16_t)0xFFF0) | (int16_t)fsr_intensity;
+            data->h3lis_y_fsr_pattern = (h3lis_raw[1] & (int16_t)0xFFF0) | (int16_t)fsr_pattern;
+            data->h3lis_z_flags       = (h3lis_raw[2] & (int16_t)0xFFF0) | 0;
             runtime_sensor_status |= SENSOR_H3LIS_OK;
         } else {
             memset(&data->h3lis_x_fsr_level, 0, 6);
@@ -660,7 +677,7 @@ void sensors_read(sensor_data_t *data)
         memset(&data->h3lis_x_fsr_level, 0, 6);
     }
 
-    // BMP581 pressure (raw is in 1/64 Pa units; decoding happens at display time)
+    // BMP581 pressure (raw is in 1/64 Pa units; Pa = raw/64)
     if (bmp_addr != 0) {
         uint8_t press[3];
         if (i2c_read_regs(bmp_addr, BMP_PRESS_XLSB, press, 3)) {
@@ -705,18 +722,19 @@ bool sensors_test(void)
     return ok;
 }
 
-uint8_t  sensors_get_status_bitmask(void)  { return runtime_sensor_status; }
-uint16_t sensors_get_i2c_error_count(void) { return i2c_error_count; }
+uint8_t  sensors_get_status_bitmask(void)   { return runtime_sensor_status; }
+uint16_t sensors_get_i2c_error_count(void)  { return i2c_error_count; }
 
 int16_t sensors_read_temperature(void)
 {
     // Return sentinel if BMP581 is absent or read fails.
-    // SENSORS_TEMP_UNAVAILABLE (-32768) equals -327.68 C, physically impossible.
+    // SENSORS_TEMP_UNAVAILABLE (-32768) = -327.68 C, physically impossible.
     // Callers must check for this value before using the result.
     if (bmp_addr == 0) return SENSORS_TEMP_UNAVAILABLE;
 
     uint8_t t[3];
-    if (!i2c_read_regs(bmp_addr, BMP_TEMP_XLSB, t, 3)) return SENSORS_TEMP_UNAVAILABLE;
+    if (!i2c_read_regs(bmp_addr, BMP_TEMP_XLSB, t, 3))
+        return SENSORS_TEMP_UNAVAILABLE;
 
     int32_t raw = (int32_t)(t[0] | (t[1] << 8) | (t[2] << 16));
     if (raw & 0x800000) raw |= (int32_t)0xFF000000; // sign-extend 24->32 bit

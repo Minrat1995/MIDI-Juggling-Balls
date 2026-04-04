@@ -186,9 +186,9 @@ static void emergency_shutdown(void)
 static void transmit_status_packet(void)
 {
     status_packet_t s;
-    s.ball_id    = BALL_ID;
-    s.sequence   = status_sequence++;
-    s.timestamp  = get_timestamp_ms();
+    s.ball_id     = BALL_ID;
+    s.sequence    = status_sequence++;
+    s.timestamp   = get_timestamp_ms();
     s.packet_type = PACKET_TYPE_STATUS;
 
     // Read temperature; check sentinel before storing.
@@ -260,8 +260,8 @@ static bool radio_init(void)
         return false;
     }
 
-    NRF_RADIO->MODE    = RADIO_MODE_MODE_Nrf_2Mbit << RADIO_MODE_MODE_Pos;
-    NRF_RADIO->TXPOWER = TX_POWER;
+    NRF_RADIO->MODE      = RADIO_MODE_MODE_Nrf_2Mbit << RADIO_MODE_MODE_Pos;
+    NRF_RADIO->TXPOWER   = TX_POWER;
     NRF_RADIO->FREQUENCY = RF_CHANNEL;
 
     NRF_RADIO->PCNF0 = 0; // No S0, no length field, no S1
@@ -273,9 +273,9 @@ static bool radio_init(void)
         (RADIO_PCNF1_ENDIAN_Little   << RADIO_PCNF1_ENDIAN_Pos)  |
         (RADIO_PCNF1_WHITEEN_Enabled << RADIO_PCNF1_WHITEEN_Pos);
 
-    NRF_RADIO->BASE0      = RADIO_BASE_ADDR;
-    NRF_RADIO->PREFIX0    = RADIO_PREFIX_ADDR;
-    NRF_RADIO->TXADDRESS  = 0;
+    NRF_RADIO->BASE0       = RADIO_BASE_ADDR;
+    NRF_RADIO->PREFIX0     = RADIO_PREFIX_ADDR;
+    NRF_RADIO->TXADDRESS   = 0;
     NRF_RADIO->RXADDRESSES = 1;
 
     NRF_RADIO->CRCCNF  = (RADIO_CRCCNF_LEN_Three    << RADIO_CRCCNF_LEN_Pos) |
@@ -290,8 +290,8 @@ static bool radio_init(void)
         (RADIO_SHORTS_END_DISABLE_Enabled << RADIO_SHORTS_END_DISABLE_Pos);
 
     // Verify critical configuration was written correctly.
-    // Checks registers with non-trivial values: a bus fault or unclocked peripheral
-    // will produce wrong readbacks rather than matching what we wrote.
+    // Checks registers with non-trivial values: a bus fault or unclocked
+    // peripheral will produce wrong readbacks rather than matching what we wrote.
     bool mode_ok    = (NRF_RADIO->MODE ==
                         (RADIO_MODE_MODE_Nrf_2Mbit << RADIO_MODE_MODE_Pos));
     bool freq_ok    = (NRF_RADIO->FREQUENCY == RF_CHANNEL);
@@ -405,6 +405,12 @@ static void prepare_packet(void)
 
 int main(void)
 {
+    // Allow time for all sensors to complete power-on sequences before firmware
+    // touches the I2C bus. The BMP581 NVM load happens in the first few ms
+    // after VDD is stable; without this delay the NVM load can fail if there
+    // is noise on the rail at power-on. Confirmed necessary in hardware testing.
+    nrf_delay_ms(100);
+
     sensor_data_t current_sensors;
     uint32_t loop_count = 0;
     uint32_t current_time_ms;
@@ -425,8 +431,8 @@ int main(void)
     // Startup banner
     SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.3 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
-    SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",   sizeof(radio_packet_t));
-    SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",   sizeof(sensor_data_t));
+    SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
+    SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));
     SEGGER_RTT_printf(0, "  status_packet_t:%u (expect 26)\r\n\r\n", sizeof(status_packet_t));
 
     // Sensors (must succeed for LSM6 + LIS3)
@@ -493,11 +499,11 @@ int main(void)
         update_sensor_history(&current_sensors);
         prepare_packet();
 
-        // Sensor values — printed once per second
+        // Sensor values printed once per second
         if (loop_count % 250 == 0) {
             // Decode H3LIS using extract_h3lis_axis() from packet_spec.h.
-            // This uses unsigned right shift (well-defined) then explicit sign
-            // extension, rather than implementation-defined signed right shift.
+            // Uses unsigned right shift (well-defined in C) then explicit sign
+            // extension from bit 11 — avoids implementation-defined signed shift.
             int16_t hx = extract_h3lis_axis(current_sensors.h3lis_x_fsr_level);
             int16_t hy = extract_h3lis_axis(current_sensors.h3lis_y_fsr_pattern);
             int16_t hz = extract_h3lis_axis(current_sensors.h3lis_z_flags);
@@ -540,7 +546,7 @@ int main(void)
             recover_radio();
         }
 
-        // Status packet
+        // Status packet every STATUS_INTERVAL_SEC seconds
         uint32_t uptime = get_uptime_seconds();
         if ((uptime - last_status_uptime_sec) >= STATUS_INTERVAL_SEC) {
             transmit_status_packet();
@@ -566,11 +572,15 @@ int main(void)
 
         if (time_diff > 0 && time_diff < 100) {
             nrf_delay_ms((uint32_t)time_diff);
-        } else if (time_diff >= 100) {
-            // Unusually far in the future — likely startup or clock artifact
-            SEGGER_RTT_printf(0, "WARN: timing resync (next TX %d ms ahead)\r\n", time_diff);
+        } else if (time_diff >= 100 || time_diff < -100) {
+            // Resync on any large deviation in either direction.
+            // Large positive: startup artifact or clock glitch.
+            // Large negative: main loop stalled (e.g. slow I2C on first BMP read).
+            // Without this catch, a large negative diff causes the loop to run
+            // flat-out trying to catch up, temporarily doubling the TX rate.
+            SEGGER_RTT_printf(0, "WARN: timing resync (diff=%d)\r\n", time_diff);
             next_tx_time = (uint16_t)current_time_ms + TX_INTERVAL_MS;
         }
-        // time_diff <= 0: past deadline, transmit immediately next iteration
+        // time_diff 0..-100: slightly behind, transmit immediately next iteration
     }
 }
