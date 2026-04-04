@@ -26,7 +26,7 @@
  *   reference counting and can cause indeterminate behaviour. The driver
  *   manages both HFCLK and LFCLK correctly when used exclusively.
  *
- * @version 1.1
+ * @version 1.2
  */
 
 #include <stdint.h>
@@ -66,7 +66,7 @@ int main(void)
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n", sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n\r\n", sizeof(sensor_data_t));
-    SEGGER_RTT_printf(0, "Channel: %d (2%03d MHz)\r\n", RF_CHANNEL, 2400 + RF_CHANNEL);
+    SEGGER_RTT_printf(0, "Channel: %d (%d MHz)\r\n", RF_CHANNEL, 2400 + RF_CHANNEL);
     SEGGER_RTT_printf(0, "Listening for up to %d balls\r\n\r\n", MAX_BALLS);
 
     packet_processor_init();
