@@ -2,13 +2,20 @@
  * Juggling Ball Wireless Receiver
  *
  * Receives 86-byte packets at 250Hz from up to 8 balls via 2.4GHz.
- * Forwards raw binary packets over USB CDC for the C++ decoder.
+ * Forwards packets over USB CDC for the C++ decoder.
  * Decodes and prints sensor values to RTT for Phase 1 validation.
  *
  * Hardware: Adafruit Feather nRF52840 (RX station, USB to PC)
  *
+ * USB framing:
+ *   Each packet is sent as 89 bytes: 0xAA 0x55 + 86 payload bytes + 1 checksum.
+ *   The two-byte sync marker locates packet boundaries. The trailing XOR
+ *   checksum (XOR of all 86 payload bytes) validates extraction — any false
+ *   sync alignment produces garbage payload data which fails the checksum,
+ *   allowing the decoder to discard it and resync cleanly.
+ *
  * Data flow:
- *   Radio ISR -> rx_packet buffer -> main loop copy -> USB CDC -> C++ decoder
+ *   Radio ISR -> rx_packet buffer -> main loop copy -> USB CDC (89 bytes) -> C++ decoder
  *                                                   -> RTT (decoded, 1Hz)
  *
  * Phase 1 validation checklist (RTT on RX):
@@ -17,7 +24,7 @@
  *   3. MAG shows non-zero values that shift when ball is rotated
  *   4. BMP shows ~101325 Pa indoors
  *   5. Loss rate <1% benchtop
- *   6. USB: 86-byte binary packets visible in serial monitor or C++ decoder
+ *   6. USB: 89-byte framed packets visible in serial monitor or C++ decoder
  *
  * HFCLK note:
  *   We use nrf_drv_clock for HFCLK rather than direct register access.
@@ -26,7 +33,7 @@
  *   reference counting and can cause indeterminate behaviour. The driver
  *   manages both HFCLK and LFCLK correctly when used exclusively.
  *
- * @version 1.2
+ * @version 1.4
  */
 
 #include <stdint.h>
@@ -45,6 +52,14 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 
 #define STATS_INTERVAL_MS   1000    // Print stats and decoded sensors every second
 
+// Two-byte sync marker prepended to every USB packet.
+// 0xAA 0x55 cannot be mistaken for a valid ball_id (1-8) at byte 0,
+// and the two-byte sequence reduces false-positive alignment to 1/65536.
+// An XOR checksum byte is appended after the payload for validation.
+// Must match SYNC_BYTE_1/2 and checksum logic in SerialReader.cpp.
+#define USB_SYNC_BYTE_0     0xAA
+#define USB_SYNC_BYTE_1     0x55
+
 int main(void)
 {
     uint32_t last_stats_time = 0;
@@ -62,10 +77,11 @@ int main(void)
 
     timing_init();
 
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball RX v1.1 ===\r\n");
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball RX v1.4 ===\r\n");
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n", sizeof(radio_packet_t));
-    SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n\r\n", sizeof(sensor_data_t));
+    SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n", sizeof(sensor_data_t));
+    SEGGER_RTT_printf(0, "  USB frame:      89 bytes (2 sync + 86 payload + 1 checksum)\r\n\r\n");
     SEGGER_RTT_printf(0, "Channel: %d (%d MHz)\r\n", RF_CHANNEL, 2400 + RF_CHANNEL);
     SEGGER_RTT_printf(0, "Listening for up to %d balls\r\n\r\n", MAX_BALLS);
 
@@ -110,9 +126,12 @@ int main(void)
             uint32_t rx_time = get_timestamp_ms();
             packet_processor_process(&local_packet, rx_time);
 
-            // Forward raw binary packet to USB (non-blocking)
+            // Forward to USB: 0xAA 0x55 + 86 payload bytes + 1 XOR checksum = 89 bytes.
+            // Checksum is computed inside usb_serial_send_framed_packet().
             if (usb_serial_ready()) {
-                usb_serial_send_packet(&local_packet);
+                usb_serial_send_framed_packet(&local_packet,
+                                             USB_SYNC_BYTE_0,
+                                             USB_SYNC_BYTE_1);
             }
         }
 

@@ -1,11 +1,24 @@
 /**
  * USB Serial Module Implementation
  *
- * Streams raw 86-byte radio_packet_t structs over USB CDC virtual serial port.
+ * Streams radio_packet_t structs over USB CDC virtual serial port.
  *
- * Hot-plug supported via nrf_drv_power_usbevt_enable() — works whether USB
- * is connected before or after power-on, and regardless of the value of
- * APP_USBD_CONFIG_EVENT_QUEUE_ENABLE in sdk_config.h.
+ * USB framing (89 bytes per packet):
+ *   [0]    sync byte 0 (0xAA)
+ *   [1]    sync byte 1 (0x55)
+ *   [2-87] radio_packet_t payload (86 bytes)
+ *   [88]   XOR checksum of bytes [2-87]
+ *
+ * The checksum is XOR of all 86 payload bytes. On the decoder side,
+ * after finding the sync header and extracting the payload, the checksum
+ * is recomputed and compared. A mismatch means the sync header was a
+ * false positive (0xAA 0x55 appearing in payload data), and the decoder
+ * discards the frame and resyncs. This eliminates the ~20% false-sync
+ * loss rate caused by 0xAA 0x55 collisions in sensor data.
+ *
+ * Phase 1 limitation: USB cable must be connected at boot.
+ * Hot-plug (connecting USB after power-on) is not supported in this version.
+ * USB init is non-fatal — if it fails, RTT validation still works fully.
  */
 
 #include "usb_serial.h"
@@ -113,35 +126,6 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event)
 }
 
 // ============================================================================
-// USB POWER EVENT HANDLER  (hot-plug support)
-// ============================================================================
-
-static void usbd_power_event_handler(nrf_drv_power_usb_evt_t event)
-{
-    switch (event) {
-        case NRF_DRV_POWER_USB_EVT_DETECTED:
-            SEGGER_RTT_printf(0, "USB: VBUS detected\r\n");
-            if (!nrf_drv_usbd_is_enabled()) {
-                app_usbd_enable();
-            }
-            break;
-
-        case NRF_DRV_POWER_USB_EVT_READY:
-            SEGGER_RTT_printf(0, "USB: VBUS ready, starting...\r\n");
-            app_usbd_start();
-            break;
-
-        case NRF_DRV_POWER_USB_EVT_REMOVED:
-            SEGGER_RTT_printf(0, "USB: VBUS removed\r\n");
-            app_usbd_stop();
-            break;
-
-        default:
-            break;
-    }
-}
-
-// ============================================================================
 // PUBLIC FUNCTIONS
 // ============================================================================
 
@@ -199,20 +183,26 @@ bool usb_serial_init(void)
         return false;
     }
 
-    // Register USB power events for hot-plug support.
-    // Uses nrf_drv_power_usbevt_enable() which works regardless of
-    // APP_USBD_CONFIG_EVENT_QUEUE_ENABLE in sdk_config.h.
-    SEGGER_RTT_printf(0, "  USB power events...\r\n");
-    static const nrf_drv_power_usbevt_config_t usbevt_config = {
-        .handler = usbd_power_event_handler
-    };
-    ret = nrf_drv_power_usbevt_enable(&usbevt_config);
-    if (ret != NRF_SUCCESS) {
-        SEGGER_RTT_printf(0, "  FAILED (0x%04X)\r\n", ret);
-        return false;
+    SEGGER_RTT_printf(0, "  Enabling USB...\r\n");
+    app_usbd_enable();
+
+    SEGGER_RTT_printf(0, "  Starting USB...\r\n");
+    app_usbd_start();
+
+    // Allow time for USB enumeration
+    uint32_t wait_ms = 0;
+    while (!usb_serial_ready() && wait_ms < 2000) {
+        app_usbd_event_queue_process();
+        nrf_delay_ms(10);
+        wait_ms += 10;
     }
 
-    SEGGER_RTT_printf(0, "USB init OK (waiting for host)\r\n");
+    if (usb_serial_ready()) {
+        SEGGER_RTT_printf(0, "USB: host connected and port open\r\n");
+    } else {
+        SEGGER_RTT_printf(0, "USB: started (host not yet connected — will connect when port opened)\r\n");
+    }
+
     return true;
 }
 
@@ -226,12 +216,35 @@ bool usb_serial_ready(void)
     return (usb_configured && port_open);
 }
 
-bool usb_serial_send_packet(const radio_packet_t *packet)
+bool usb_serial_send_framed_packet(const radio_packet_t *packet,
+                                   uint8_t sync0,
+                                   uint8_t sync1)
 {
     if (!usb_serial_ready()) return false;
-    ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm,
-                                             packet,
-                                             sizeof(radio_packet_t));
+
+    ret_code_t ret;
+
+    // --- Sync header ---
+    uint8_t sync[2] = { sync0, sync1 };
+    ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, sync, 2);
+    if (ret != NRF_SUCCESS) return false;
+
+    // --- Payload ---
+    ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, packet, sizeof(radio_packet_t));
+    if (ret != NRF_SUCCESS) return false;
+
+    // --- XOR checksum over all 86 payload bytes ---
+    // Recomputed by the decoder after extraction. Any false sync alignment
+    // produces garbage payload bytes whose XOR will not match, allowing
+    // the decoder to discard the frame and resync without passing bad data
+    // to the application.
+    const uint8_t *bytes = (const uint8_t *)packet;
+    uint8_t checksum = 0;
+    for (size_t i = 0; i < sizeof(radio_packet_t); i++) {
+        checksum ^= bytes[i];
+    }
+
+    ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, &checksum, 1);
     return (ret == NRF_SUCCESS);
 }
 
