@@ -222,29 +222,42 @@ bool usb_serial_send_framed_packet(const radio_packet_t *packet,
 {
     if (!usb_serial_ready()) return false;
 
-    ret_code_t ret;
+    // Assemble the complete 89-byte frame into a single local buffer.
+    //
+    // CRITICAL: do not split this into multiple app_usbd_cdc_acm_write() calls.
+    // Each write is non-blocking. If the USB TX buffer is busy when the second
+    // or third write fires, it returns NRF_ERROR_BUSY and we return false —
+    // but the preceding bytes have already been sent. A dangling sync header
+    // (0xAA 0x55 with no payload) corrupts the byte stream and misaligns the
+    // decoder for every subsequent packet until recovery.
+    //
+    // A single write either succeeds completely or fails completely. If it
+    // fails (TX busy), the packet is silently dropped — the decoder sees this
+    // as a sequence gap identical to RF packet loss. No stream corruption.
+    //
+    // Frame layout:
+    //   [0]    sync0 (0xAA)
+    //   [1]    sync1 (0x55)
+    //   [2-87] radio_packet_t payload (86 bytes)
+    //   [88]   XOR checksum of bytes [2-87]
 
-    // --- Sync header ---
-    uint8_t sync[2] = { sync0, sync1 };
-    ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, sync, 2);
-    if (ret != NRF_SUCCESS) return false;
+    uint8_t frame[2 + sizeof(radio_packet_t) + 1]; // 89 bytes
 
-    // --- Payload ---
-    ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, packet, sizeof(radio_packet_t));
-    if (ret != NRF_SUCCESS) return false;
+    frame[0] = sync0;
+    frame[1] = sync1;
+    memcpy(&frame[2], packet, sizeof(radio_packet_t));
 
-    // --- XOR checksum over all 86 payload bytes ---
-    // Recomputed by the decoder after extraction. Any false sync alignment
-    // produces garbage payload bytes whose XOR will not match, allowing
-    // the decoder to discard the frame and resync without passing bad data
-    // to the application.
+    // XOR checksum over the 86 payload bytes.
+    // Any false-sync alignment produces garbage payload whose XOR will not
+    // match, allowing the decoder to discard and resync cleanly.
     const uint8_t *bytes = (const uint8_t *)packet;
     uint8_t checksum = 0;
     for (size_t i = 0; i < sizeof(radio_packet_t); i++) {
         checksum ^= bytes[i];
     }
+    frame[2 + sizeof(radio_packet_t)] = checksum;
 
-    ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, &checksum, 1);
+    ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, frame, sizeof(frame));
     return (ret == NRF_SUCCESS);
 }
 
