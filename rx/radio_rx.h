@@ -55,8 +55,9 @@ bool radio_packet_available(void);
  * true and the next radio interrupt. Make a local copy before calling
  * radio_clear_packet_flag().
  *
- * At 125Hz (8ms between packets) you have 8ms to copy. This is ample for
- * a memcpy but do not do blocking work before copying.
+ * At 250Hz (4ms between packets) you have 4ms to copy before the next
+ * packet may overwrite the buffer. A memcpy of 86 bytes takes ~1us.
+ * Do not do blocking work before copying.
  *
  * @return Pointer to received packet (do not cache across interrupt boundary)
  */

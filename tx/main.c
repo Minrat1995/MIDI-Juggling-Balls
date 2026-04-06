@@ -13,7 +13,26 @@
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
  *   LIS3MDL:             80Hz   - TX 3.1x faster, ~every 3rd packet has fresh mag data
  *
- * @version 3.3
+ * @version 3.4
+ *
+ * Changelog from 3.3:
+ *   - radio_init(): power cycle delay increased 10us -> 1ms. 10us was empirically
+ *     too short for the radio peripheral power domain to stabilise after POWER=0/1.
+ *     If the peripheral is not fully powered when radio_init() reads STATE, the
+ *     readback is wrong and init returns false unconditionally.
+ *   - transmit_packet(): __DMB() added before TASKS_TXEN. The Cortex-M4 write
+ *     buffer can hold pending stores to tx_packet in SRAM. Without a barrier the
+ *     DMA transfer can begin before all stores are visible to the bus fabric,
+ *     resulting in stale or partially-updated packet data being transmitted.
+ *   - recover_radio(): now polls EVENTS_DISABLED rather than sleeping a fixed 1ms.
+ *     On a timeout or mid-TX failure the DISABLED event may arrive up to several
+ *     hundred us after TASKS_DISABLE; sleeping 1ms was a guess and not reliable.
+ *   - recover_radio(): removed indicate_error_radio() call. That function blocked
+ *     for 3 seconds per call and returned to the main loop. A failed recover_radio()
+ *     caused the loop to call transmit_packet() immediately, fail again, call
+ *     recover_radio() again, block 3 more seconds, and so on. The main loop's
+ *     1Hz LED heartbeat (toggled every 250 packets) provides sufficient liveness
+ *     indication; a frozen heartbeat means the radio is stuck.
  */
 
 #include <stdint.h>
@@ -249,8 +268,18 @@ static void transmit_status_packet(void)
 
 static bool radio_init(void)
 {
-    NRF_RADIO->POWER = 0; nrf_delay_us(10);
-    NRF_RADIO->POWER = 1; nrf_delay_us(10);
+    // Power-cycle the radio peripheral.
+    //
+    // Delay after POWER=0 and POWER=1 increased from 10us to 1ms.
+    // 10us was insufficient for the peripheral's internal power domain to
+    // stabilise before firmware accesses its registers. With 10us, the
+    // STATE readback below could return a non-DISABLED value not because
+    // the radio was active, but because the register bus hadn't settled,
+    // causing radio_init() to return false unconditionally and forcing
+    // repeated recovery attempts. 1ms matches Nordic SDK reference examples
+    // and provides reliable stabilisation across temperature and supply variation.
+    NRF_RADIO->POWER = 0; nrf_delay_ms(1);
+    NRF_RADIO->POWER = 1; nrf_delay_ms(1);
 
     // After power-on, radio must be DISABLED before configuration.
     // A non-DISABLED state here indicates the peripheral did not reset cleanly.
@@ -314,6 +343,14 @@ static bool transmit_packet(void)
     NRF_RADIO->EVENTS_READY    = 0;
     NRF_RADIO->EVENTS_END      = 0;
     NRF_RADIO->EVENTS_DISABLED = 0;
+
+    // __DMB() (Data Memory Barrier) flushes the Cortex-M4 write buffer before
+    // the DMA transfer begins. Without this, stores to tx_packet in SRAM may
+    // still be pending in the write buffer when TASKS_TXEN triggers the radio
+    // DMA, causing stale or partially-updated data to be transmitted.
+    // The barrier must appear after the last write to tx_packet (in
+    // prepare_packet()) and before TASKS_TXEN.
+    __DMB();
     NRF_RADIO->TASKS_TXEN = 1;
 
     t = 1000;
@@ -356,23 +393,53 @@ static void indicate_error_fatal(void)
     }
 }
 
-static void indicate_error_radio(void)
-{
-    for (int i = 0; i < 3; i++) {
-        NRF_P1->OUTSET = (1 << LED_PIN); nrf_delay_ms(500);
-        NRF_P1->OUTCLR = (1 << LED_PIN); nrf_delay_ms(500);
-    }
-}
+// indicate_error_radio() removed.
+//
+// It was called from recover_radio() when radio_init() failed after a TX
+// timeout. The function blocked for 3 seconds and returned, at which point
+// the main loop called transmit_packet() immediately, failed again, called
+// recover_radio() again, failed again, and blocked for another 3 seconds.
+// This produced a cascade of 3-second blockages rather than recovery.
+//
+// The 1Hz LED heartbeat toggled in the main loop provides sufficient liveness
+// indication. A frozen heartbeat means the radio is stuck. Removing
+// indicate_error_radio() allows the main loop to continue cycling, which
+// gives recover_radio() repeated chances to succeed (e.g. if the failure
+// was a transient bus glitch rather than a hard hardware fault).
 
 static void recover_radio(void)
 {
     SEGGER_RTT_printf(0, "Radio: attempting recovery...\r\n");
+
+    // Issue TASKS_DISABLE and wait for EVENTS_DISABLED before reinitialising.
+    //
+    // Previously: TASKS_DISABLE = 1; nrf_delay_ms(1); radio_init();
+    // The 1ms sleep was a guess. If the radio was mid-transmission when a
+    // timeout fired, the disable sequence could take longer than 1ms to
+    // complete. radio_init() then power-cycled the peripheral and checked
+    // STATE == DISABLED; if DISABLED hadn't arrived yet, the readback was
+    // wrong and radio_init() returned false, making recovery always fail.
+    //
+    // Polling EVENTS_DISABLED is the correct approach. The event is set by
+    // hardware when the radio has fully disabled. Timeout of 10ms is
+    // conservative; the disable sequence is typically complete in <1ms.
     NRF_RADIO->TASKS_DISABLE = 1;
-    nrf_delay_ms(1);
+
+    uint32_t t = 10000;  // 10ms in 1us steps
+    while (!NRF_RADIO->EVENTS_DISABLED && t > 0) { nrf_delay_us(1); t--; }
+    if (!t) {
+        SEGGER_RTT_printf(0, "Radio: TASKS_DISABLE timed out during recovery\r\n");
+    }
+    NRF_RADIO->EVENTS_DISABLED = 0;
+
     if (!radio_init()) {
         radio_status = RADIO_STATE_STARTUP_FAILED;
-        SEGGER_RTT_printf(0, "Radio: recovery FAILED\r\n");
-        indicate_error_radio();
+        SEGGER_RTT_printf(0, "Radio: recovery FAILED — will retry next TX cycle\r\n");
+        // Do not call indicate_error_radio() here. See note above.
+        // The main loop will attempt transmit_packet() next iteration,
+        // which will fail and call recover_radio() again. This is the
+        // desired behaviour: repeated recovery attempts rather than
+        // cascading 3-second blockages.
     } else {
         SEGGER_RTT_printf(0, "Radio: recovered\r\n");
     }
@@ -397,6 +464,8 @@ static void prepare_packet(void)
     memcpy(&tx_packet.data_t0, &sensor_history[0], sizeof(sensor_data_t));
     memcpy(&tx_packet.data_t1, &sensor_history[1], sizeof(sensor_data_t));
     memcpy(&tx_packet.data_t2, &sensor_history[2], sizeof(sensor_data_t));
+    // Note: __DMB() is called in transmit_packet() before TASKS_TXEN,
+    // after all writes to tx_packet are complete.
 }
 
 // ============================================================================
@@ -429,7 +498,7 @@ int main(void)
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.3 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.4 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));

@@ -18,6 +18,15 @@
  *   EscapeCommFunction(SETDTR) is called after opening the port to
  *   trigger APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN on the RX firmware.
  *   Without this, usb_serial_ready() stays false and no bytes are sent.
+ *
+ * Auto-detection:
+ *   Two-pass search. Pass 1 scans GUID_DEVCLASS_PORTS (devices already
+ *   classified as COM ports by Windows). Pass 2 scans all device classes
+ *   via DIGCF_ALLCLASSES — catches the nRF52840 CDC ACM device when the
+ *   usbser.sys driver has not yet been matched (first connection, missing
+ *   INF, or composite USB device where the child interface node has not
+ *   been assigned a class yet). Both passes filter by VID 0x239A and look
+ *   for a PortName registry value under the device's driver key.
  */
 
 #include "SerialReader.h"
@@ -37,11 +46,20 @@ static constexpr uint8_t SYNC_BYTE_2 = 0x55;
 // AUTO-DETECT
 // ============================================================================
 
-std::string SerialReader::AutoDetectPort(uint16_t vid)
+/**
+ * Scan a device info set for a device matching the given VID that has a
+ * COM port name in its driver registry key.
+ *
+ * Factored out of AutoDetectPort so it can be called with different
+ * HDEVINFO sets (Ports class, all classes) without duplicating the
+ * per-device enumeration logic.
+ *
+ * @param devInfo  Device info set to scan. Must not be INVALID_HANDLE_VALUE.
+ * @param vid      USB Vendor ID to match (e.g. 0x239A for Adafruit).
+ * @return         COM port name (e.g. "COM5") or empty string if not found.
+ */
+static std::string ScanDeviceInfoSet(HDEVINFO devInfo, uint16_t vid)
 {
-    HDEVINFO devInfo = SetupDiGetClassDevs(
-        &GUID_DEVCLASS_PORTS, nullptr, nullptr, DIGCF_PRESENT);
-
     if (devInfo == INVALID_HANDLE_VALUE)
         return {};
 
@@ -88,8 +106,48 @@ std::string SerialReader::AutoDetectPort(uint16_t vid)
         }
     }
 
-    SetupDiDestroyDeviceInfoList(devInfo);
     return result;
+}
+
+std::string SerialReader::AutoDetectPort(uint16_t vid)
+{
+    // Pass 1: Ports device class.
+    //
+    // GUID_DEVCLASS_PORTS is the fast path and covers the common case: the
+    // nRF52840 CDC ACM interface enumerated correctly and Windows has matched
+    // it to usbser.sys, placing it under the Ports class. This happens on any
+    // machine that has connected an nRF52840 Feather before, or on Windows 10+
+    // where usbser.sys matches CDC ACM devices without a custom INF.
+    {
+        HDEVINFO h = SetupDiGetClassDevs(
+            &GUID_DEVCLASS_PORTS, nullptr, nullptr, DIGCF_PRESENT);
+        std::string r = ScanDeviceInfoSet(h, vid);
+        SetupDiDestroyDeviceInfoList(h);
+        if (!r.empty()) return r;
+    }
+
+    // Pass 2: All device classes.
+    //
+    // If Pass 1 found nothing, the device may be present but not yet assigned
+    // to the Ports class. This happens on first connection before usbser.sys
+    // has been matched, or on systems where the CDC ACM driver is installed
+    // but the device node hasn't been fully enumerated yet (e.g. the parent
+    // composite device node exists but the child interface node's class hasn't
+    // been written). DIGCF_ALLCLASSES enumerates every present device
+    // regardless of class. We still filter by VID and require a PortName
+    // registry value, so only actual COM-port-bearing devices are returned.
+    //
+    // This pass is slower (scans all devices on the system) but only runs
+    // when Pass 1 found nothing, which is the uncommon case.
+    {
+        HDEVINFO h = SetupDiGetClassDevs(
+            nullptr, nullptr, nullptr, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+        std::string r = ScanDeviceInfoSet(h, vid);
+        SetupDiDestroyDeviceInfoList(h);
+        if (!r.empty()) return r;
+    }
+
+    return {};
 }
 
 // ============================================================================

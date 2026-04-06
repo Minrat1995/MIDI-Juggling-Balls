@@ -1,5 +1,5 @@
 /**
- * MIDI Juggling Balls — PC Decoder
+ * MIDI Juggling Balls - PC Decoder
  * Phase 1.5: USB read + console decode validation
  *
  * Run with no arguments to auto-detect the RX Feather.
@@ -11,6 +11,15 @@
  *
  * OSC output is stubbed. Implement OscSender and call it after
  * decoding each packet once this console output looks correct.
+ *
+ * False sync handling:
+ *   The two-byte sync header 0xAA 0x55 can appear by chance inside the
+ *   86-byte sensor payload. When it does, SerialReader extracts a misaligned
+ *   packet and passes it up. Sequence number validation catches these: a
+ *   gap >= 500 from the last known good sequence is implausible at 250Hz
+ *   under normal RF conditions and indicates a false sync rather than real
+ *   packet loss. Those packets are discarded here before affecting stats
+ *   or OSC output.
  */
 
 #include <windows.h>
@@ -77,12 +86,12 @@ static void decode_packet(const radio_packet_t& raw, DecodedPacket& out)
 
 // TODO: Replace with OscSender once console output validates correctly.
 // Suggested OSC path layout (per project spec):
-//   /ball/N/accel   [x y z] g
-//   /ball/N/gyro    [x y z] dps
-//   /ball/N/mag     [x y z] gauss
-//   /ball/N/h3lis   [x y z] g
+//   /ball/N/accel    [x y z] g
+//   /ball/N/gyro     [x y z] dps
+//   /ball/N/mag      [x y z] gauss
+//   /ball/N/h3lis    [x y z] g
 //   /ball/N/pressure float Pa
-//   /ball/N/fsr     intensity(int) pattern(int)
+//   /ball/N/fsr      intensity(int) pattern(int)
 static void send_osc(const DecodedPacket& /*pkt*/)
 {
     // Not yet implemented.
@@ -166,12 +175,13 @@ int main(int argc, char* argv[])
     printf("Expected at rest: ACCEL ~1g on one axis, BMP ~101325 Pa\n\n");
 
     // --- Main loop ---
-    uint32_t printedPackets  = 0;
-    uint32_t lastStatsTime   = GetTickCount();
-    uint32_t lastSeq[9]      = {};    // per-ball, index 1-8
-    uint32_t lostPackets[9]  = {};
-    uint32_t rxPackets[9]    = {};
-    bool     seenBall[9]     = {};
+    uint32_t printedPackets = 0;
+    uint32_t lastStatsTime  = GetTickCount();
+    uint32_t falseSyncs[9]  = {};  // per-ball false sync discard count
+    uint16_t lastSeq[9]     = {};  // per-ball last validated sequence (uint16 for wrap arithmetic)
+    uint32_t lostPackets[9] = {};
+    uint32_t rxPackets[9]   = {};
+    bool     seenBall[9]    = {};
 
     // Print every Nth packet to avoid flooding the console.
     // At 250Hz this prints ~25 lines/sec — adjust as needed.
@@ -185,12 +195,28 @@ int main(int argc, char* argv[])
             uint8_t id = raw.ball_id;
             if (id >= 1 && id <= 8)
             {
-                // Track sequence gaps
                 if (seenBall[id])
                 {
-                    uint16_t expected = static_cast<uint16_t>(lastSeq[id] + 1);
-                    uint16_t gap = static_cast<uint16_t>(raw.sequence - expected);
-                    if (gap > 0 && gap < 500)
+                    // Sequence gap using uint16 wrapping arithmetic, matching
+                    // the embedded firmware. Gap >= 500 at 250Hz means either
+                    // a TX restart (handled separately in the embedded RX) or,
+                    // much more likely here, a false sync from 0xAA 0x55
+                    // appearing in the payload. Discard and continue.
+                    uint16_t gap = static_cast<uint16_t>(
+                        raw.sequence - lastSeq[id] - 1);
+
+                    if (gap >= 500)
+                    {
+                        falseSyncs[id]++;
+                        fprintf(stderr,
+                            "Decoder: false sync discarded "
+                            "(ball=%u seq=%u last=%u gap=%u total_discarded=%u)\n",
+                            id, raw.sequence, lastSeq[id], gap, falseSyncs[id]);
+                        continue;  // back to top of while(true)
+                    }
+
+                    // Real gap — count as lost packets
+                    if (gap > 0)
                         lostPackets[id] += gap;
                 }
                 else
@@ -202,14 +228,14 @@ int main(int argc, char* argv[])
                 lastSeq[id] = raw.sequence;
                 rxPackets[id]++;
 
-                // Decode
+                // Decode to physical units
                 DecodedPacket decoded;
                 decode_packet(raw, decoded);
 
-                // OSC output (stub)
+                // OSC output (stub — implement OscSender here)
                 send_osc(decoded);
 
-                // Console output (throttled)
+                // Console output throttled to PRINT_EVERY packets
                 if (printedPackets % PRINT_EVERY == 0)
                     print_packet(decoded);
 
@@ -235,13 +261,13 @@ int main(int argc, char* argv[])
                 float lossRate = total > 0
                     ? 100.0f * lostPackets[i] / static_cast<float>(total)
                     : 0.0f;
-                printf("Ball %d: rx=%u  lost=%u  loss=%.2f%%\n",
-                       i, rxPackets[i], lostPackets[i], lossRate);
+                printf("Ball %d: rx=%u  lost=%u  loss=%.2f%%  false_syncs=%u\n",
+                       i, rxPackets[i], lostPackets[i], lossRate, falseSyncs[i]);
             }
             printf("\n");
         }
 
-        // Yield briefly to avoid spinning at 100% CPU when no packets arrive.
+        // Yield to avoid spinning at 100% CPU.
         // At 250Hz a packet arrives every 4ms so this does not add latency.
         Sleep(1);
     }
