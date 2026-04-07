@@ -1,6 +1,6 @@
 # MIDI Juggling Balls — Project Reference
 
-**Version:** Post Phase 1.5 partial (TX v3.3, RX v1.4, Decoder built, USB framing blocked)
+**Version:** Post Phase 1.5 (TX v3.4, RX v1.5, Decoder working, USB framing confirmed clean)
 **Goal:** Wireless juggling ball → sensor data → sound reinforcing visual performance
 **Repo:** https://github.com/Minrat1995/MIDI-Juggling-Balls (private)
 **Target:** <20ms perceived latency, <1% packet loss, scalable to 3+ balls
@@ -10,43 +10,24 @@
 ## CURRENT STATUS
 
 ### What is done
-- TX firmware v3.3: all sensors validated on hardware, 250Hz confirmed stable
-- RX firmware v1.4: end-to-end radio validated, ~0.5% RF packet loss benchtop
-- USB framing: 89-byte frame (0xAA 0x55 + 86 payload + 1 XOR checksum) implemented in RX
-- C++ decoder built in VS2019, opens COM14, DTR asserted, parses framed packets
-- Decoder confirmed receiving data and decoding to correct physical values
-- Git repo includes decoder/ subfolder with full VS2019 project
+- TX firmware v3.4: all sensors validated on hardware, 250Hz confirmed stable, radio recovery cascade fixed
+- RX firmware v1.5: end-to-end radio validated, ~0.7% RF packet loss benchtop
+- USB framing: confirmed working end-to-end. 0 resyncs, decoder loss matches RF loss (~0.7%)
+- C++ decoder: auto-detects COM14 via SERIALCOMM registry fallback, decodes to correct physical values
+- Full data pipeline confirmed: TX → radio → RX → USB → decoder → console output
 
-### Immediate blocking issue
-USB frame corruption: the 89-byte single write in `usb_serial_send_framed_packet()`
-exceeds the CDC ACM TX buffer in sdk_config.h (likely 64 bytes), causing ~99% packet
-loss at the decoder. **Fix required before proceeding:**
-
-```
-In: C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_rx_feather\pca10056\blank\ses\sdk_config.h
-Find: APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE (or similar CDC ACM buffer define)
-Change value to: 256
-Rebuild and reflash RX in SES.
-```
-
-Run this to find the exact define name:
-```cmd
-findstr /i "CDC_ACM\|BUFF_SIZE\|EP_SIZE" C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_rx_feather\pca10056\blank\ses\sdk_config.h
-```
-
-### Immediate next tasks (after buffer fix confirmed)
-1. Confirm decoder loss rate matches RX RTT (~0.5%) with sdk_config.h fix
-2. Implement OSC output in decoder (stub already in place)
-3. Connect Pure Data patch, ASIO output
-4. Success criterion: move ball, hear sensor data drive audio in real time
+### Immediate next tasks
+1. Implement OSC output in decoder (stub already in place)
+2. Connect Pure Data patch, ASIO output
+3. Success criterion: move ball, hear sensor data drive audio in real time
 
 ### Known open issue — TX freeze after ~10-15 minutes
-TX RTT and radio ISR both go silent after extended operation. Most likely cause:
-nrf_drv_twi blocking hang in `sensors_read()` — the SDK TWI driver can spin-wait
-indefinitely if a sensor fails to respond (Errata 89/121). RX continues running
-but receives nothing. Workaround: restart TX. Needs investigation before Phase 2.
-Diagnostic: when freeze occurs, check TX RTT before restarting to confirm it has
-also stopped — this rules out RX-side failure.
+Previously observed TX RTT and radio ISR going silent after extended operation. The radio
+recovery cascade (3s blocking per failed recovery attempt) has been fixed in v3.4 and may
+have been a contributing factor. Genuine TWI driver hang (nrf_drv_twi blocking on Errata 89/121)
+may still occur independently. Continue monitoring. If freeze recurs, check TX RTT for TWI
+error accumulation in the status packet (printed every 2 minutes).
+Diagnostic: when freeze occurs, note whether TX RTT is also silent (confirms TX-side cause).
 
 ---
 
@@ -249,10 +230,12 @@ C:\Projects\MIDI-Juggling-Balls\decoder\MidiJugglingDecoder\
 ### Running the decoder
 ```cmd
 cd C:\Projects\MIDI-Juggling-Balls\decoder\MidiJugglingDecoder\Debug
-MidiJugglingDecoder.exe COM14
+MidiJugglingDecoder.exe
 ```
-Auto-detect does not work (device enumerates as generic USB Serial, not Adafruit VID).
-Always pass COM14 explicitly. If the port changes, check Device Manager.
+Auto-detect now works via SERIALCOMM registry fallback: if VID 0x239A is not found (Feather
+enumerates as generic USB Serial on this machine), it falls back to the only active COM port
+(COM14). Prints a warning when using the fallback. If multiple COM ports are active, it lists
+them and exits — pass the port explicitly in that case: `MidiJugglingDecoder.exe COM14`.
 
 ### Decoder architecture
 - `SerialReader`: background thread, ReadFile loop, 256-byte read chunks
@@ -286,7 +269,7 @@ MIDI (discrete events, Phase 2):
 
 After flashing TX, connect J-Link and open RTT terminal. Expected startup:
 ```
-=== Juggling Ball TX (Ball 1) v3.3 ===
+=== Juggling Ball TX (Ball 1) v3.4 ===
 Packet sizes:
   radio_packet_t: 86 (expect 86)      <- must match
   sensor_data_t:  27 (expect 27)      <- must match
@@ -324,7 +307,7 @@ Disconnecting J-Link from TX triggers a reset; wait for TX to reinitialise.
 
 Expected RX output:
 ```
-=== Juggling Ball RX v1.4 ===
+=== Juggling Ball RX v1.5 ===
   radio_packet_t: 86 (expect 86)
   sensor_data_t:  27 (expect 27)
   USB frame:      89 bytes (2 sync + 86 payload + 1 checksum)
@@ -385,7 +368,16 @@ Acceptable benchtop results:
 | Gap heuristic threshold 1000 undocumented | packet_processor.c | Reduced to 500, documented |
 | radio_rx.h 125Hz comment | radio_rx.h | Stale — corrected to 250Hz/4ms |
 | usb_serial_send_packet() three separate writes | usb_serial.c | Partial frame on TX buffer busy — replaced with single atomic 89-byte write |
-| USB CDC TX buffer too small for 89-byte frame | sdk_config.h | **OPEN** — causes ~99% decoder loss. Fix: set CDC ACM buffer to 256 |
+| radio_init power cycle delay 10us (TX) | main.c (TX) | Too short for peripheral bus stabilisation; caused STATE readback failures and recovery cascade |
+| transmit_packet missing __DMB() before TASKS_TXEN (TX) | main.c (TX) | Cortex-M4 write buffer could hold pending stores; DMA might read stale packet data |
+| recover_radio fixed 1ms sleep (TX) | main.c (TX) | Insufficient wait for DISABLED; caused always-fail recovery loop |
+| indicate_error_radio() in recover_radio (TX) | main.c (TX) | 3s blocking per call cascaded into indefinite loop of blockages |
+| **usb_serial_send_framed_packet frame on stack (RX)** | usb_serial.c | **Root cause of 99% decoder loss. DMA reads freed stack memory for last 25 bytes (second USB bulk packet). Fix: static frame buffer + TX_DONE guard** |
+| APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 64 (RX) | sdk_config.h | SDK default 64 < 89-byte frame; changed to 256 (necessary but not sufficient — stack bug was the primary cause) |
+| AutoDetectPort GUID_DEVCLASS_PORTS only (PC) | SerialReader.cpp | Failed when Feather enumerates as generic USB Serial; added DIGCF_ALLCLASSES pass + SERIALCOMM registry fallback |
+| usb_serial_send_framed_packet return value discarded (RX) | main.c (RX) | USB TX drops invisible; added usb_tx_drop_count with RTT output |
+| usb_serial.c CDC ACM buffer size uninstrumented (RX) | usb_serial.c | No runtime confirmation of compiled value; added RTT print (since removed once confirmed) |
+| USB CDC TX buffer too small for 89-byte frame | sdk_config.h | **FIXED** — APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256 |
 
 ---
 
@@ -446,8 +438,8 @@ git commit -m "description"
 git push
 ```
 
-**sdk_config.h is now included in the commit routine** — it contains the CDC ACM
-buffer size which is part of the USB framing contract.
+**sdk_config.h is version-controlled** — it contains APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256
+which is part of the USB framing contract. Must be committed with firmware changes.
 
 **packet_spec.h must be identical in tx\ and rx\ at all times.**
 
@@ -457,15 +449,14 @@ buffer size which is part of the USB framing contract.
 
 ### Phase 1 (complete): Single ball, full data flow
 - All sensors validated on TX RTT
-- End-to-end radio validated: TX → RX → RTT, ~0.5% packet loss benchtop
+- End-to-end radio validated: TX → RX → RTT, ~0.7% packet loss benchtop
 - USB CDC confirmed: 89-byte framed packets to PC
+- C++ decoder confirmed: clean framing, 0 resyncs, loss matches RF loss
 
 ### Phase 1.5 (in progress): C++ decoder → OSC → Pure Data
-- C++ decoder built and receiving data ✓
-- USB framing (sync + checksum) implemented ✓
-- **BLOCKED: sdk_config.h CDC buffer size fix required**
-- After fix: confirm loss rate matches RTT (~0.5%)
-- Implement OSC output (stub in place)
+- C++ decoder receiving clean data ✓
+- USB framing confirmed end-to-end ✓
+- **NEXT: implement OSC output (stub in place)**
 - Connect Pure Data patch, ASIO output
 - Success criterion: move ball, hear sensor data drive audio in real time
 
@@ -531,17 +522,22 @@ Further reduction possible by wiring LSM6DSOX INT1 for interrupt-driven reads (P
 
 ### Decoder shows 0 bytes received
 1. Check RX RTT for "USB: port opened by host" — if absent, DTR assertion failed
-2. Confirm COM port is correct in Device Manager (currently COM14)
+2. Confirm COM port in Device Manager (currently COM14 — auto-detect falls back to it)
 3. RX must be plugged in before boot — hot-plug not supported
 4. Only one program can own the COM port — close any serial monitors first
 
-### Decoder shows high loss (~99%) with many resyncs
-Most likely cause: CDC ACM TX buffer too small for 89-byte frame.
-Fix: set APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256 in sdk_config.h, rebuild, reflash.
+### Decoder shows high loss with many resyncs
+If resyncs are climbing and almost no packets are accepted:
+1. Confirm sdk_config.h has APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256
+2. Confirm the define is actually compiled in: check RX RTT startup for "CDC ACM TX buf: 256 bytes"
+   (if this line is absent, the diagnostic was removed in v1.5 — add it back temporarily)
+3. Do a full Clean + Build in SES — normal rebuild does not recompile cached objects
+4. Confirm usb_serial.c frame buffer is `static uint8_t s_tx_frame[89]` not a local variable
+   (local variable = DMA reads freed stack for second USB bulk packet = garbage last 25 bytes)
 
 ### Decoder shows ~20% loss with "bad ball_id 170" messages
 Cause: old RX firmware (v1.2 or v1.3 with three-write bug) — reflects in stream.
-Fix: reflash RX with v1.4 firmware.
+Fix: reflash RX with v1.5 firmware.
 
 ### TX freezes after ~10-15 minutes
 RTT goes silent, radio ISR stops. Most likely nrf_drv_twi blocking hang.
@@ -583,6 +579,8 @@ Does not affect pressure output if PRESS_EN is set correctly. Not actionable.
 - **On-air packet size: 86 bytes. USB frame: 89 bytes (sync + payload + checksum).**
 - **packet_spec.h must be identical in tx\ and rx\.** Run fc to verify before committing.
 - **sdk_config.h is version-controlled** and must be committed with firmware changes.
+- **APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256** in sdk_config.h. Default 64 is too small.
+- **usb_serial frame buffer is static.** Do not change it back to a local variable — DMA reads it after the function returns (second USB bulk packet fires after function exit).
 - **BMP581 OSR_CONFIG must be 0x52.** Bit 6 = PRESS_EN. 0x12 = pressure disabled.
 - **BMP581 NVM error is normal.** Observed on all tested Adafruit units. Not a fault.
 - **BMP581 needs 100nF decoupling cap on VDD.** Required for reliable power-on.
@@ -595,10 +593,10 @@ Does not affect pressure output if PRESS_EN is set correctly. Not actionable.
 - **USB init is non-fatal on RX.** RTT validation works without USB.
 - **TX does not need J-Link to transmit.** USB power is sufficient after flashing.
 - **Disconnecting J-Link from TX resets it.** Allow 2-3s reinit before expecting packets on RX.
-- **Decoder: always pass COM14 explicitly.** Auto-detect does not work (generic USB VID).
+- **Decoder auto-detects COM14** via SERIALCOMM fallback. No argument needed if only one COM port active.
 - **Decoder requires DTR assertion.** SerialReader.cpp calls EscapeCommFunction(SETDTR).
 - **USB single-write is mandatory.** Three separate writes corrupt the stream on TX buffer busy.
-- **CDC ACM TX buffer must be ≥ 89 bytes.** Set to 256 in sdk_config.h.
+- **CDC ACM TX buffer must be 256 bytes.** Set in sdk_config.h, requires Clean+Build in SES.
 - **SDK not in git.** nRF5 SDK v17.1.0, download separately from Nordic.
 - **SES .emProject not in git.** Contains absolute paths, machine-specific.
 - **VS2019 .sln and .vcxproj ARE in git.** These are safe to commit (no absolute paths).

@@ -33,7 +33,14 @@
  *   reference counting and can cause indeterminate behaviour. The driver
  *   manages both HFCLK and LFCLK correctly when used exclusively.
  *
- * @version 1.4
+ * @version 1.5
+ *
+ * Changelog from 1.4:
+ *   - usb_tx_drop_count added: tracks packets where usb_serial_send_framed_packet()
+ *     returns false (USB not ready or TX buffer busy). Previously these were
+ *     silently discarded with no visibility. The drop count is printed in the
+ *     1Hz stats block alongside RF loss stats, making USB vs RF loss
+ *     distinguishable from the decoder side.
  */
 
 #include <stdint.h>
@@ -65,6 +72,11 @@ int main(void)
     uint32_t last_stats_time = 0;
     ret_code_t ret;
 
+    // Count USB TX drops: incremented when usb_serial_send_framed_packet()
+    // returns false (TX buffer busy or port not ready). Printed in the 1Hz
+    // stats block so USB drops are distinguishable from RF packet loss.
+    uint32_t usb_tx_drop_count = 0;
+
     // Initialise the clock driver. This must happen before anything that
     // uses the clock driver abstraction, including the USB stack.
     ret = nrf_drv_clock_init();
@@ -77,7 +89,7 @@ int main(void)
 
     timing_init();
 
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball RX v1.4 ===\r\n");
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball RX v1.5 ===\r\n");
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n", sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n", sizeof(sensor_data_t));
@@ -128,10 +140,15 @@ int main(void)
 
             // Forward to USB: 0xAA 0x55 + 86 payload bytes + 1 XOR checksum = 89 bytes.
             // Checksum is computed inside usb_serial_send_framed_packet().
+            // Track drops: a false return means the TX buffer was busy or the port
+            // was not ready. The decoder sees this as a sequence gap identical to
+            // RF packet loss — usb_tx_drop_count separates the two causes.
             if (usb_serial_ready()) {
-                usb_serial_send_framed_packet(&local_packet,
-                                             USB_SYNC_BYTE_0,
-                                             USB_SYNC_BYTE_1);
+                if (!usb_serial_send_framed_packet(&local_packet,
+                                                   USB_SYNC_BYTE_0,
+                                                   USB_SYNC_BYTE_1)) {
+                    usb_tx_drop_count++;
+                }
             }
         }
 
@@ -143,6 +160,12 @@ int main(void)
         if (now - last_stats_time >= STATS_INTERVAL_MS) {
             last_stats_time = now;
             packet_processor_print_statistics();
+
+            // USB drop count printed here so USB vs RF loss are distinguishable.
+            // A rising usb_tx_drop_count with low RF loss means the USB TX buffer
+            // is consistently full — the primary cause is APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE
+            // being too small (must be >= 89, set to 256 in sdk_config.h).
+            SEGGER_RTT_printf(0, "USB TX drops: %lu\r\n", usb_tx_drop_count);
         }
 
         // Sleep until next interrupt (radio END or RTC tick).

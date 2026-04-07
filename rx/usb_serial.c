@@ -62,6 +62,29 @@ APP_USBD_CDC_ACM_GLOBAL_DEF(m_app_cdc_acm,
 static volatile bool usb_configured = false;
 static volatile bool port_open      = false;
 
+// TX frame buffer and state.
+//
+// app_usbd_cdc_acm_write() is non-blocking: it starts a USB DMA transfer and
+// returns immediately. The DMA hardware continues reading from the buffer
+// pointer asynchronously, potentially across two USB bulk packets (64 bytes,
+// then the remainder). If the buffer is a local stack variable, the function
+// returns and the stack is reused while the DMA for the second packet is still
+// in flight, causing garbage to be transmitted.
+//
+// Fix: keep the frame buffer as a module-level static. The DMA always reads
+// from live memory.
+//
+// Secondary concern: if usb_serial_send_framed_packet() is called again before
+// the DMA from the previous call completes, the static buffer would be
+// overwritten mid-transfer. This is prevented by s_tx_busy: the TX_DONE
+// callback clears it, and send_framed_packet drops the incoming packet if it
+// is still set. At 250Hz (4ms period) with DMA completing in ~1ms this guard
+// is almost never triggered in normal operation. When it is, the dropped
+// packet is indistinguishable from RF packet loss at the decoder.
+#define FRAME_SIZE (2 + sizeof(radio_packet_t) + 1)  // 89 bytes
+static uint8_t          s_tx_frame[FRAME_SIZE];
+static volatile bool    s_tx_busy = false;
+
 // ============================================================================
 // CDC ACM EVENT HANDLER
 // ============================================================================
@@ -71,14 +94,19 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst,
 {
     switch (event) {
         case APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN:
-            port_open = true;
+            port_open  = true;
+            s_tx_busy  = false;  // clear any stale pending state on reconnect
             SEGGER_RTT_printf(0, "USB: port opened by host\r\n");
             break;
         case APP_USBD_CDC_ACM_USER_EVT_PORT_CLOSE:
             port_open = false;
+            s_tx_busy = false;
             SEGGER_RTT_printf(0, "USB: port closed\r\n");
             break;
         case APP_USBD_CDC_ACM_USER_EVT_TX_DONE:
+            // All bytes from the last write have been transferred to the USB
+            // host. The static frame buffer is now safe to overwrite.
+            s_tx_busy = false;
             break;
         case APP_USBD_CDC_ACM_USER_EVT_RX_DONE:
             break;
@@ -222,43 +250,44 @@ bool usb_serial_send_framed_packet(const radio_packet_t *packet,
 {
     if (!usb_serial_ready()) return false;
 
-    // Assemble the complete 89-byte frame into a single local buffer.
+    // Guard: drop if the previous DMA transfer is still in flight.
+    // s_tx_busy is set here and cleared in TX_DONE. At 250Hz this guard is
+    // almost never triggered (DMA completes in ~1ms, period is 4ms), but it
+    // prevents buffer corruption in the event of a timing anomaly.
+    if (s_tx_busy) return false;
+
+    // Build the 89-byte frame into the module-level static buffer.
     //
-    // CRITICAL: do not split this into multiple app_usbd_cdc_acm_write() calls.
-    // Each write is non-blocking. If the USB TX buffer is busy when the second
-    // or third write fires, it returns NRF_ERROR_BUSY and we return false —
-    // but the preceding bytes have already been sent. A dangling sync header
-    // (0xAA 0x55 with no payload) corrupts the byte stream and misaligns the
-    // decoder for every subsequent packet until recovery.
-    //
-    // A single write either succeeds completely or fails completely. If it
-    // fails (TX busy), the packet is silently dropped — the decoder sees this
-    // as a sequence gap identical to RF packet loss. No stream corruption.
+    // The buffer MUST be static (not a local stack variable). app_usbd_cdc_acm_write
+    // is non-blocking: it starts DMA and returns immediately. For frames larger than
+    // one USB full-speed bulk packet (64 bytes), the hardware sends the first 64
+    // bytes, fires TX_DONE, then sends the remaining 25 bytes. If the buffer is on
+    // the stack, the function has already returned and the stack has been reused
+    // by the time the second DMA fires, so the last 25 bytes are garbage.
     //
     // Frame layout:
     //   [0]    sync0 (0xAA)
     //   [1]    sync1 (0x55)
     //   [2-87] radio_packet_t payload (86 bytes)
     //   [88]   XOR checksum of bytes [2-87]
+    s_tx_frame[0] = sync0;
+    s_tx_frame[1] = sync1;
+    memcpy(&s_tx_frame[2], packet, sizeof(radio_packet_t));
 
-    uint8_t frame[2 + sizeof(radio_packet_t) + 1]; // 89 bytes
-
-    frame[0] = sync0;
-    frame[1] = sync1;
-    memcpy(&frame[2], packet, sizeof(radio_packet_t));
-
-    // XOR checksum over the 86 payload bytes.
-    // Any false-sync alignment produces garbage payload whose XOR will not
-    // match, allowing the decoder to discard and resync cleanly.
     const uint8_t *bytes = (const uint8_t *)packet;
     uint8_t checksum = 0;
     for (size_t i = 0; i < sizeof(radio_packet_t); i++) {
         checksum ^= bytes[i];
     }
-    frame[2 + sizeof(radio_packet_t)] = checksum;
+    s_tx_frame[2 + sizeof(radio_packet_t)] = checksum;
 
-    ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, frame, sizeof(frame));
-    return (ret == NRF_SUCCESS);
+    s_tx_busy = true;
+    ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, s_tx_frame, FRAME_SIZE);
+    if (ret != NRF_SUCCESS) {
+        s_tx_busy = false;
+        return false;
+    }
+    return true;
 }
 
 bool usb_serial_send_text(const char *text)

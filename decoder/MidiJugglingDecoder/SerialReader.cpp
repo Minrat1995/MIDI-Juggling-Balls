@@ -109,6 +109,66 @@ static std::string ScanDeviceInfoSet(HDEVINFO devInfo, uint16_t vid)
     return result;
 }
 
+/**
+ * Enumerate all active COM ports from the Windows serial device map registry
+ * key: HKLM\HARDWARE\DEVICEMAP\SERIALCOMM
+ *
+ * This key is maintained by Windows and lists every COM port that is currently
+ * active (driver loaded, device present). It does not require knowing the VID,
+ * PID, or device class — it works for any COM port regardless of how Windows
+ * has classified the underlying device.
+ *
+ * Used as a last-resort pass in AutoDetectPort when VID-based matching fails.
+ * The nRF52840 Feather can enumerate as a generic "USB Serial Device" without
+ * exposing its Adafruit VID to the Ports device class, which defeats both
+ * VID-based passes. This pass finds it regardless.
+ *
+ * @return  Vector of COM port names (e.g. {"COM14", "COM3"}) currently active.
+ *          Empty if none found or registry key unavailable.
+ */
+static std::vector<std::string> EnumerateAllComPorts()
+{
+    std::vector<std::string> ports;
+
+    HKEY hKey;
+    LONG result = RegOpenKeyExA(
+        HKEY_LOCAL_MACHINE,
+        "HARDWARE\\DEVICEMAP\\SERIALCOMM",
+        0, KEY_READ, &hKey);
+
+    if (result != ERROR_SUCCESS)
+        return ports;
+
+    DWORD index = 0;
+    char  valueName[256];
+    char  portName[64];
+    DWORD nameLen, dataLen, type;
+
+    while (true)
+    {
+        nameLen = sizeof(valueName);
+        dataLen = sizeof(portName);
+        type    = REG_SZ;
+
+        result = RegEnumValueA(hKey, index++,
+                               valueName, &nameLen,
+                               nullptr, &type,
+                               reinterpret_cast<LPBYTE>(portName), &dataLen);
+
+        if (result == ERROR_NO_MORE_ITEMS)
+            break;
+
+        if (result == ERROR_SUCCESS && type == REG_SZ &&
+            strncmp(portName, "COM", 3) == 0)
+        {
+            ports.push_back(portName);
+        }
+    }
+
+    RegCloseKey(hKey);
+    return ports;
+}
+
 std::string SerialReader::AutoDetectPort(uint16_t vid)
 {
     // Pass 1: Ports device class.
@@ -123,17 +183,18 @@ std::string SerialReader::AutoDetectPort(uint16_t vid)
             &GUID_DEVCLASS_PORTS, nullptr, nullptr, DIGCF_PRESENT);
         std::string r = ScanDeviceInfoSet(h, vid);
         SetupDiDestroyDeviceInfoList(h);
-        if (!r.empty()) return r;
+        if (!r.empty())
+        {
+            printf("Auto-detect: found via Ports class (VID 0x%04X): %s\n",
+                   vid, r.c_str());
+            return r;
+        }
     }
 
     // Pass 2: All device classes.
     //
     // If Pass 1 found nothing, the device may be present but not yet assigned
-    // to the Ports class. This happens on first connection before usbser.sys
-    // has been matched, or on systems where the CDC ACM driver is installed
-    // but the device node hasn't been fully enumerated yet (e.g. the parent
-    // composite device node exists but the child interface node's class hasn't
-    // been written). DIGCF_ALLCLASSES enumerates every present device
+    // to the Ports class. DIGCF_ALLCLASSES enumerates every present device
     // regardless of class. We still filter by VID and require a PortName
     // registry value, so only actual COM-port-bearing devices are returned.
     //
@@ -144,10 +205,59 @@ std::string SerialReader::AutoDetectPort(uint16_t vid)
             nullptr, nullptr, nullptr, DIGCF_PRESENT | DIGCF_ALLCLASSES);
         std::string r = ScanDeviceInfoSet(h, vid);
         SetupDiDestroyDeviceInfoList(h);
-        if (!r.empty()) return r;
+        if (!r.empty())
+        {
+            printf("Auto-detect: found via all-classes scan (VID 0x%04X): %s\n",
+                   vid, r.c_str());
+            return r;
+        }
     }
 
-    return {};
+    // Pass 3: All active COM ports (no VID filtering).
+    //
+    // Both VID-based passes failed. The device is present but not advertising
+    // its Adafruit VID — typically because Windows has loaded the generic
+    // usbser.sys driver without associating the VID (this is the known
+    // behaviour on the development machine where the Feather enumerates as
+    // "USB Serial Device" on COM14).
+    //
+    // Read HKLM\HARDWARE\DEVICEMAP\SERIALCOMM, which lists every active COM
+    // port regardless of device class or VID. If exactly one port is active,
+    // use it. If multiple ports are present, list them and require the user
+    // to specify explicitly — we cannot distinguish the RX Feather from other
+    // COM devices without VID information.
+    {
+        std::vector<std::string> ports = EnumerateAllComPorts();
+
+        if (ports.empty())
+        {
+            fprintf(stderr,
+                "Auto-detect: no active COM ports found in SERIALCOMM registry.\n");
+            return {};
+        }
+
+        if (ports.size() == 1)
+        {
+            fprintf(stderr,
+                "Auto-detect WARNING: VID 0x%04X not found in device list.\n"
+                "  Falling back to the only active COM port: %s\n"
+                "  This port has not been verified as the RX Feather.\n"
+                "  If this is wrong, pass the correct port explicitly: decoder.exe COM5\n\n",
+                vid, ports[0].c_str());
+            return ports[0];
+        }
+
+        // Multiple ports — cannot safely guess which is the RX Feather.
+        fprintf(stderr,
+            "Auto-detect: VID 0x%04X not found, and multiple COM ports are active.\n"
+            "  Cannot determine which is the RX Feather. Active ports:\n",
+            vid);
+        for (const auto& p : ports)
+            fprintf(stderr, "    %s\n", p.c_str());
+        fprintf(stderr,
+            "  Pass the correct port explicitly: decoder.exe COM14\n");
+        return {};
+    }
 }
 
 // ============================================================================

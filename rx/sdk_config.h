@@ -3112,6 +3112,26 @@
 // </h> 
 //==========================================================
 
+// ============================================================================
+// USB CDC ACM TX buffer size
+//
+// APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE controls the size of the internal
+// endpoint IN buffer used by app_usbd_cdc_acm_write(). The SDK default is
+// 64 bytes, which is also the USB full-speed bulk endpoint max packet size.
+//
+// usb_serial_send_framed_packet() sends 89-byte frames (2 sync + 86 payload
+// + 1 checksum) in a single app_usbd_cdc_acm_write() call. With the default
+// 64-byte buffer the write is rejected or truncated: the PC decoder receives
+// malformed frames and cannot lock sync, producing ~99% apparent packet loss.
+//
+// 256 bytes is sufficient for the current 89-byte frame with headroom for
+// future growth (Phase 3 multi-ball does not change the frame size).
+// Must be a power of 2 per SDK requirements.
+// ============================================================================
+#ifndef APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE
+#define APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE 256
+#endif
+
 // <<< end of configuration section >>>
 #endif //SDK_CONFIG_H
 
