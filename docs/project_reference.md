@@ -1,6 +1,6 @@
 # MIDI Juggling Balls — Project Reference
 
-**Version:** Post Phase 1.5 (TX v3.4, RX v1.5, Decoder working, USB framing confirmed clean)
+**Version:** Post cleanup session (TX v3.4, RX v1.5, Decoder v1.5, full pipeline validated clean)
 **Goal:** Wireless juggling ball → sensor data → sound reinforcing visual performance
 **Repo:** https://github.com/Minrat1995/MIDI-Juggling-Balls (private)
 **Target:** <20ms perceived latency, <1% packet loss, scalable to 3+ balls
@@ -11,10 +11,13 @@
 
 ### What is done
 - TX firmware v3.4: all sensors validated on hardware, 250Hz confirmed stable, radio recovery cascade fixed
-- RX firmware v1.5: end-to-end radio validated, ~0.7% RF packet loss benchtop
-- USB framing: confirmed working end-to-end. 0 resyncs, decoder loss matches RF loss (~0.7%)
+- RX firmware v1.5: end-to-end radio validated, ~1-2% RF packet loss benchtop (see RF Loss Pattern below)
+- USB framing: confirmed working end-to-end. 0 resyncs, decoder queue drops = 0
 - C++ decoder: auto-detects COM14 via SERIALCOMM registry fallback, decodes to correct physical values
 - Full data pipeline confirmed: TX → radio → RX → USB → decoder → console output
+- LIS3MDL confirmed running at 155Hz (FAST_ODR, CTRL_REG1=0xFE)
+- All sensors confirmed at startup: LSM6=0x6A LIS3=0x1C H3LIS=0x18 BMP=0x46 (CHIP_ID=0x50)
+- Decoder drain-loop fix confirmed: queue_drops=0 in steady state
 
 ### Immediate next tasks
 1. Implement OSC output in decoder (stub already in place)
@@ -22,12 +25,17 @@
 3. Success criterion: move ball, hear sensor data drive audio in real time
 
 ### Known open issue — TX freeze after ~10-15 minutes
-Previously observed TX RTT and radio ISR going silent after extended operation. The radio
-recovery cascade (3s blocking per failed recovery attempt) has been fixed in v3.4 and may
-have been a contributing factor. Genuine TWI driver hang (nrf_drv_twi blocking on Errata 89/121)
-may still occur independently. Continue monitoring. If freeze recurs, check TX RTT for TWI
-error accumulation in the status packet (printed every 2 minutes).
+Observed again this session: TX RTT goes silent, requires manual restart. The radio recovery
+cascade fix in v3.4 was not the root cause. Genuine TWI driver hang (nrf_drv_twi blocking on
+Errata 89/121) is the most likely remaining cause. Continue monitoring.
 Diagnostic: when freeze occurs, note whether TX RTT is also silent (confirms TX-side cause).
+Fix planned: NVIC_SystemReset() watchdog before Phase 2 extended testing.
+
+### RF loss pattern observed
+Benchtop loss settles in one of two stable states: ~1-2% or <0.5%. Transitions are abrupt
+at session start and tend to stay in whichever state they land. Isolated single-packet losses,
+not bursts. Consistent with WiFi channel 6 (2437MHz) interference on RF channel 40 (2440MHz).
+Mitigation: test channels 20 and 80 if loss is consistently above 1%.
 
 ---
 
@@ -180,12 +188,13 @@ Shortcuts:   READY→START, END→DISABLE, DISABLED→RXEN (RX auto-loop)
 - Auto-increment on I2C burst reads (no special flag needed)
 
 ### LIS3MDL
-- CTRL_REG1 = 0xFC: ultra-high perf XY, 80Hz, temp enabled
+- CTRL_REG1 = 0xFE: ultra-high perf XY, 155Hz (FAST_ODR=1), temp enabled
+  - Changed from 0xFC (80Hz). FAST_ODR is bit 1; setting it with OM=11 (UHP) enables 155Hz.
 - CTRL_REG2 = 0x00: +/-4 gauss
 - CTRL_REG3 = 0x00: continuous conversion
 - CTRL_REG4 = 0x0C: ultra-high perf Z, little-endian
 - **Requires | 0x80 on register address for multi-byte I2C burst reads**
-- Effective output rate ~31Hz at 250Hz TX polling (polled every ~8th cycle)
+- Effective output rate: 155Hz. At 250Hz TX polling, ~every 1.6 packets has fresh mag data (was every 3rd at 80Hz)
 - Duplicate mag readings in packet stream are normal and harmless
 
 ### H3LIS331
@@ -373,6 +382,13 @@ Acceptable benchtop results:
 | recover_radio fixed 1ms sleep (TX) | main.c (TX) | Insufficient wait for DISABLED; caused always-fail recovery loop |
 | indicate_error_radio() in recover_radio (TX) | main.c (TX) | 3s blocking per call cascaded into indefinite loop of blockages |
 | **usb_serial_send_framed_packet frame on stack (RX)** | usb_serial.c | **Root cause of 99% decoder loss. DMA reads freed stack memory for last 25 bytes (second USB bulk packet). Fix: static frame buffer + TX_DONE guard** |
+| USB framing constants defined in 4 places | main.c (RX), usb_serial.c, SerialReader.cpp | Could silently drift on change. Fix: USB_SYNC_BYTE_0/1 and USB_FRAME_SIZE centralised in packet_spec.h |
+| usb_serial_send_text() missing s_tx_busy guard | usb_serial.c | Could corrupt ongoing DMA transfer if called while framed packet in flight |
+| SerialReader::Close() races on ReadFile HANDLE | SerialReader.cpp | CloseHandle called while ReadFile may still hold it. Fix: CancelSynchronousIo before CloseHandle |
+| SerialReader::ProcessBytes() O(n) erase per resync byte | SerialReader.cpp | Quadratic in sustained resync storm. Fix: read_pos index, single erase at end |
+| SerialReader packet queue unbounded | SerialReader.cpp | Unbounded growth under backlog. Fix: MAX_QUEUE_DEPTH=500, drop oldest on overflow |
+| RX timing.c LFCLK via direct register writes | timing.c | Bypassed nrf_drv_clock reference counting, contradicting RX design contract. Fix: nrf_drv_clock_lfclk_request() |
+| LIS3MDL ODR 80Hz (CTRL_REG1=0xFC) | sensors.c | Sensor refreshed only every ~3rd packet at 250Hz TX rate. Fix: 0xFE (FAST_ODR=1) = 155Hz |
 | APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 64 (RX) | sdk_config.h | SDK default 64 < 89-byte frame; changed to 256 (necessary but not sufficient — stack bug was the primary cause) |
 | AutoDetectPort GUID_DEVCLASS_PORTS only (PC) | SerialReader.cpp | Failed when Feather enumerates as generic USB Serial; added DIGCF_ALLCLASSES pass + SERIALCOMM registry fallback |
 | usb_serial_send_framed_packet return value discarded (RX) | main.c (RX) | USB TX drops invisible; added usb_tx_drop_count with RTT output |
@@ -381,15 +397,22 @@ Acceptable benchtop results:
 
 ---
 
-## FILE LOCATIONS
+## FILE LOCATIONS AND COMMIT ROUTINE
+
+**Claude: read this section before generating any file paths or copy commands.**
 
 ### SDK working directories (SES compiles from here)
+
 ```
 TX: C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_tx\pca10056\blank\ses\
 RX: C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_rx_feather\pca10056\blank\ses\
 ```
 
-### Git repo
+IMPORTANT: TX directory is `juggling_ball_tx` — NOT `juggling_ball_tx_feather`.
+The RX directory IS `juggling_ball_rx_feather`. These are different.
+
+### Git repo structure
+
 ```
 C:\Projects\MIDI-Juggling-Balls\
 ├── tx\       main.c  sensors.c  sensors.h  packet_spec.h  sdk_config.h
@@ -403,43 +426,64 @@ C:\Projects\MIDI-Juggling-Balls\
 └── docs\     project_reference.md  hardware_reference.md
 ```
 
-### packet_spec.h copies — three files, intentionally different
-```
-tx\packet_spec.h          On-air contract, C, _Static_assert
-rx\packet_spec.h          Must be byte-identical to tx\ copy
-decoder\...\packet_spec.h C++ version: static_assert, scaling helpers added
-```
-The session commit routine fc-checks tx\ vs rx\ only. The decoder copy is
-intentionally different and is not checked automatically.
+The decoder VS2019 project lives inside the repo at:
+`C:\Projects\MIDI-Juggling-Balls\decoder\MidiJugglingDecoder\`
+The DECODER path variable and the repo decoder path are the same location.
+Do not copy decoder files — they are already in the repo. Only copy TX and RX from SDK.
 
-### Commit routine (end of each session)
+### packet_spec.h — three copies, intentionally different
+
+```
+tx\packet_spec.h              On-air contract, C, _Static_assert
+rx\packet_spec.h              Must be byte-identical to tx\ copy — fc checks this
+decoder\...\packet_spec.h     C++ version: static_assert, constexpr, scaling helpers added
+```
+
+The session commit routine fc-checks tx\ vs rx\ only. The decoder copy is
+intentionally different (C++ syntax) and is not checked automatically.
+
+### Full commit routine (end of each session)
+
 ```cmd
 cd C:\Projects\MIDI-Juggling-Balls
 set TX_SDK=C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_tx\pca10056\blank\ses
 set RX_SDK=C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_rx_feather\pca10056\blank\ses
+
+:: Copy TX files from SDK into repo
 copy /Y %TX_SDK%\main.c        tx\
 copy /Y %TX_SDK%\sensors.c     tx\
 copy /Y %TX_SDK%\sensors.h     tx\
 copy /Y %TX_SDK%\packet_spec.h tx\
-copy /Y %RX_SDK%\main.c        rx\
-copy /Y %RX_SDK%\radio_rx.c    rx\
-copy /Y %RX_SDK%\radio_rx.h    rx\
-copy /Y %RX_SDK%\packet_processor.c rx\
-copy /Y %RX_SDK%\packet_processor.h rx\
-copy /Y %RX_SDK%\timing.c      rx\
-copy /Y %RX_SDK%\timing.h      rx\
-copy /Y %RX_SDK%\usb_serial.c  rx\
-copy /Y %RX_SDK%\usb_serial.h  rx\
-copy /Y %RX_SDK%\packet_spec.h rx\
-copy /Y %RX_SDK%\sdk_config.h  rx\
+
+:: Copy RX files from SDK into repo
+copy /Y %RX_SDK%\main.c              rx\
+copy /Y %RX_SDK%\radio_rx.c          rx\
+copy /Y %RX_SDK%\radio_rx.h          rx\
+copy /Y %RX_SDK%\packet_processor.c  rx\
+copy /Y %RX_SDK%\packet_processor.h  rx\
+copy /Y %RX_SDK%\timing.c            rx\
+copy /Y %RX_SDK%\timing.h            rx\
+copy /Y %RX_SDK%\usb_serial.c        rx\
+copy /Y %RX_SDK%\usb_serial.h        rx\
+copy /Y %RX_SDK%\packet_spec.h       rx\
+copy /Y %RX_SDK%\sdk_config.h        rx\
+
+:: Decoder files are already in the repo — no copy needed
+:: docs\project_reference.md is already in the repo — copy from Downloads if updated:
+:: copy /Y "C:\Users\Martin\Downloads\project_reference.md" docs\
+
+:: Verify packet_spec.h is identical TX vs RX
 fc tx\packet_spec.h rx\packet_spec.h
+
+:: Stage, review, commit
 git add tx\ rx\ decoder\ docs\
+git status
 git commit -m "description"
 git push
 ```
 
-**sdk_config.h is version-controlled** — it contains APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256
-which is part of the USB framing contract. Must be committed with firmware changes.
+**sdk_config.h is version-controlled** — contains APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256.
+Must be committed with any firmware changes.
 
 **packet_spec.h must be identical in tx\ and rx\ at all times.**
 
@@ -476,6 +520,8 @@ which is part of the USB framing contract. Must be committed with firmware chang
 - Collision probability unslotted ~28% → near zero with slotting
 - BLE + proprietary radio coexistence requires design decision (SoftDevice vs timesharing)
 - C++ decoder already routes to /ball/N/ — no structural decoder changes needed
+- **Review SerialReader::MAX_QUEUE_DEPTH at transition.** Currently 500 entries = 2s at 250Hz single-ball, ~0.67s at 750Hz three-ball. Monitor GetQueueDropCount() during initial multi-ball testing.
+- **Monitor RX ISR overwrite risk.** Single rx_packet buffer is overwritten every 4ms. At 3x250Hz, the main loop has less margin between copies. Confirm usb_tx_drop_count stays near zero before moving to ring buffer phase.
 
 ### Phase 4: Performance ready
 - 30+ minute stress testing
@@ -575,17 +621,32 @@ Does not affect pressure output if PRESS_EN is set correctly. Not actionable.
 
 ## KEY REMINDERS FOR NEW SESSIONS
 
+### File paths — read before generating any commands
+```
+TX SDK:   C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_tx\pca10056\blank\ses\
+RX SDK:   C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_rx_feather\pca10056\blank\ses\
+Repo:     C:\Projects\MIDI-Juggling-Balls\
+Decoder:  C:\Projects\MIDI-Juggling-Balls\decoder\MidiJugglingDecoder\
+```
+TX is `juggling_ball_tx`. RX is `juggling_ball_rx_feather`. They differ.
+Decoder is inside the repo — files are not copied, they are edited in place.
+project_reference.md lives at docs\ inside the repo.
+Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
+
 - **TX rate is 250Hz (4ms).** Any reference to 125Hz/8ms is obsolete.
 - **On-air packet size: 86 bytes. USB frame: 89 bytes (sync + payload + checksum).**
+- **USB framing constants are in packet_spec.h.** USB_SYNC_BYTE_0 (0xAA), USB_SYNC_BYTE_1 (0x55), USB_FRAME_SIZE (89). Do not redefine locally in usb_serial.c, main.c (RX), or SerialReader.cpp.
 - **packet_spec.h must be identical in tx\ and rx\.** Run fc to verify before committing.
 - **sdk_config.h is version-controlled** and must be committed with firmware changes.
 - **APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256** in sdk_config.h. Default 64 is too small.
 - **usb_serial frame buffer is static.** Do not change it back to a local variable — DMA reads it after the function returns (second USB bulk packet fires after function exit).
+- **usb_serial_send_text() checks s_tx_busy.** Both send paths share the USB endpoint; overlapping writes corrupt the transfer.
+- **RX LFCLK via nrf_drv_clock_lfclk_request(), not direct registers.** Direct writes bypass driver reference counting and can cause RTC1 to stop if the USB stack releases LFCLK.
 - **BMP581 OSR_CONFIG must be 0x52.** Bit 6 = PRESS_EN. 0x12 = pressure disabled.
 - **BMP581 NVM error is normal.** Observed on all tested Adafruit units. Not a fault.
 - **BMP581 needs 100nF decoupling cap on VDD.** Required for reliable power-on.
 - **BMP581: pa = raw/64.** On-chip compensation. No NVM, no polynomial.
-- **LIS3MDL burst read needs | 0x80.** LSM6DSOX does not. H3LIS331 also needs | 0x80.
+- **LIS3MDL CTRL_REG1 = 0xFE (155Hz, FAST_ODR=1).** Previous value 0xFC = 80Hz. Burst read needs | 0x80. LSM6DSOX does not. H3LIS331 also needs | 0x80.
 - **Gyro is +/-500dps.** Decoder and Pure Data must use this for scaling.
 - **H3LIS is +/-400g.** Do not confuse with LSM6 +/-16g scale.
 - **H3LIS decode: use extract_h3lis_axis().** Do not use arithmetic right shift.
@@ -597,6 +658,7 @@ Does not affect pressure output if PRESS_EN is set correctly. Not actionable.
 - **Decoder requires DTR assertion.** SerialReader.cpp calls EscapeCommFunction(SETDTR).
 - **USB single-write is mandatory.** Three separate writes corrupt the stream on TX buffer busy.
 - **CDC ACM TX buffer must be 256 bytes.** Set in sdk_config.h, requires Clean+Build in SES.
+- **SerialReader queue drops (GetQueueDropCount) should be zero** during single-ball operation. Non-zero at Phase 3 multi-ball means consumer loop cannot keep up — review MAX_QUEUE_DEPTH and Sleep(1) budget.
 - **SDK not in git.** nRF5 SDK v17.1.0, download separately from Nordic.
 - **SES .emProject not in git.** Contains absolute paths, machine-specific.
 - **VS2019 .sln and .vcxproj ARE in git.** These are safe to commit (no absolute paths).
