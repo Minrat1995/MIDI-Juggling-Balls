@@ -1,18 +1,25 @@
 /**
  * SerialReader implementation
  *
- * USB framing: RX firmware sends 89 bytes per packet:
- *   [0]    0xAA  sync byte 0
- *   [1]    0x55  sync byte 1
+ * USB framing: RX firmware sends USB_FRAME_SIZE (89) bytes per packet:
+ *   [0]    USB_SYNC_BYTE_0 (0xAA)
+ *   [1]    USB_SYNC_BYTE_1 (0x55)
  *   [2-87] radio_packet_t payload (86 bytes)
  *   [88]   XOR checksum of bytes [2-87]
  *
+ * Framing constants are defined in packet_spec.h and shared with the
+ * RX firmware. Do not redefine them here.
+ *
  * Packet boundary detection:
- *   Scan for 0xAA 0x55 at buffer[0..1]. If found, extract 86 bytes,
- *   recompute XOR checksum, compare to byte[88]. A mismatch means the
- *   sync header was a false positive (0xAA 0x55 appearing in payload
- *   data) — discard one byte and resync. A match means the frame is
- *   valid and the packet is enqueued.
+ *   Scan for USB_SYNC_BYTE_0/1 at the current buffer position. If found,
+ *   extract 86 bytes, recompute XOR checksum, compare to byte[88]. A
+ *   mismatch means the sync header was a false positive (0xAA 0x55
+ *   appearing in payload data) — advance one byte and retry. A match
+ *   means the frame is valid and the packet is enqueued.
+ *
+ *   All advancement through the accumulation buffer is done via a
+ *   read_pos index; the single erase at the end of ProcessBytes removes
+ *   all consumed bytes in one operation rather than one byte at a time.
  *
  * DTR assertion:
  *   EscapeCommFunction(SETDTR) is called after opening the port to
@@ -38,9 +45,6 @@
 #include <cstring>
 
 #pragma comment(lib, "setupapi.lib")
-
-static constexpr uint8_t SYNC_BYTE_1 = 0xAA;
-static constexpr uint8_t SYNC_BYTE_2 = 0x55;
 
 // ============================================================================
 // AUTO-DETECT
@@ -238,12 +242,8 @@ std::string SerialReader::AutoDetectPort(uint16_t vid)
 
         if (ports.size() == 1)
         {
-            fprintf(stderr,
-                "Auto-detect WARNING: VID 0x%04X not found in device list.\n"
-                "  Falling back to the only active COM port: %s\n"
-                "  This port has not been verified as the RX Feather.\n"
-                "  If this is wrong, pass the correct port explicitly: decoder.exe COM5\n\n",
-                vid, ports[0].c_str());
+            printf("Auto-detect: VID 0x%04X not found; using sole active port: %s\n",
+                   vid, ports[0].c_str());
             return ports[0];
         }
 
@@ -325,6 +325,21 @@ void SerialReader::Close()
 {
     m_running = false;
 
+    // Cancel any blocking ReadFile before closing the handle.
+    //
+    // Without CancelSynchronousIo, the sequence is: set m_running=false,
+    // CloseHandle, join. If the thread is inside ReadFile when CloseHandle
+    // fires, ReadFile returns an error and the thread exits via the !ok path —
+    // this works in practice, but CloseHandle on a HANDLE that is still
+    // being used in a synchronous API call is technically a race. Issuing
+    // CancelSynchronousIo first signals the OS to abort the in-progress
+    // ReadFile cleanly before we touch the handle.
+    //
+    // CancelSynchronousIo returns FALSE with ERROR_NOT_FOUND if the thread
+    // is not currently blocked in a synchronous call; that is not an error.
+    if (m_thread.joinable())
+        CancelSynchronousIo(m_thread.native_handle());
+
     if (m_hPort != INVALID_HANDLE_VALUE)
     {
         CloseHandle(m_hPort);
@@ -382,50 +397,48 @@ void SerialReader::ProcessBytes(const uint8_t* data, size_t len)
         return;
     }
 
-    // Frame layout: SYNC_BYTE_1 SYNC_BYTE_2 [86 payload bytes] [1 checksum] = 89 bytes.
+    // Frame layout: USB_SYNC_BYTE_0 USB_SYNC_BYTE_1 [86 payload bytes] [1 checksum]
+    // = USB_FRAME_SIZE (89) bytes total.
     //
-    // Steps:
-    //   1. Check buffer[0..1] == 0xAA 0x55
-    //   2. Extract 86 payload bytes from buffer[2..87]
-    //   3. Compute XOR of those 86 bytes
-    //   4. Compare to buffer[88]
-    //   5. Mismatch = false sync: discard one byte, increment resync, retry
-    //   6. Match = valid frame: enqueue packet
-    static constexpr size_t FRAMED_SIZE = 2 + PACKET_SIZE + 1; // 89 bytes
+    // read_pos advances through m_accumBuffer without erasing. All consumed
+    // bytes are removed in a single erase at the end of the function.
+    // This avoids O(n) shifts on every misaligned byte during resync.
+    static constexpr size_t FRAMED_SIZE = static_cast<size_t>(USB_FRAME_SIZE);
 
-    while (m_accumBuffer.size() >= FRAMED_SIZE)
+    size_t read_pos = 0;
+
+    while (read_pos + FRAMED_SIZE <= m_accumBuffer.size())
     {
-        if (m_accumBuffer[0] == SYNC_BYTE_1 && m_accumBuffer[1] == SYNC_BYTE_2)
+        if (m_accumBuffer[read_pos]     == USB_SYNC_BYTE_0 &&
+            m_accumBuffer[read_pos + 1] == USB_SYNC_BYTE_1)
         {
             // Sync header found. Verify checksum before accepting.
             uint8_t computed = 0;
-            for (size_t i = 2; i < 2 + PACKET_SIZE; i++)
+            for (size_t i = read_pos + 2; i < read_pos + 2 + PACKET_SIZE; i++)
                 computed ^= m_accumBuffer[i];
 
-            uint8_t received = m_accumBuffer[2 + PACKET_SIZE];
+            uint8_t received = m_accumBuffer[read_pos + 2 + PACKET_SIZE];
 
             if (computed != received)
             {
                 // Checksum mismatch: this 0xAA 0x55 was in the payload data,
-                // not a real frame boundary. Discard one byte and resync.
-                m_accumBuffer.erase(m_accumBuffer.begin());
-                m_resyncCount++;
-
-                if (m_resyncCount <= 10 || m_resyncCount % 1000 == 0)
+                // not a real frame boundary. Advance one byte and resync.
+                uint32_t count = ++m_resyncCount;
+                if (count <= 10 || count % 1000 == 0)
                 {
                     fprintf(stderr,
                         "SerialReader: checksum mismatch (computed=0x%02X received=0x%02X)"
                         " resync #%u\n",
-                        computed, received, m_resyncCount.load());
+                        computed, received, count);
                 }
+                read_pos++;
                 continue;
             }
 
             // Checksum OK. Extract the payload.
             radio_packet_t pkt;
-            memcpy(&pkt, m_accumBuffer.data() + 2, PACKET_SIZE);
-            m_accumBuffer.erase(m_accumBuffer.begin(),
-                                m_accumBuffer.begin() + FRAMED_SIZE);
+            memcpy(&pkt, m_accumBuffer.data() + read_pos + 2, PACKET_SIZE);
+            read_pos += FRAMED_SIZE;
 
             // Belt-and-suspenders: ball_id must still be 1-8.
             // A valid checksum on a false-aligned frame is possible with
@@ -441,26 +454,44 @@ void SerialReader::ProcessBytes(const uint8_t* data, size_t len)
 
             {
                 std::lock_guard<std::mutex> lock(m_queueMutex);
+                if (m_packetQueue.size() >= MAX_QUEUE_DEPTH)
+                {
+                    // Queue is full. Drop the oldest packet to make room for
+                    // the newest — current sensor state is more useful than
+                    // stale data from 2+ seconds ago.
+                    m_packetQueue.pop();
+                    uint32_t drops = ++m_queueDropCount;
+                    if (drops <= 5 || drops % 100 == 0)
+                    {
+                        fprintf(stderr,
+                            "SerialReader: queue full, oldest packet dropped"
+                            " (total drops=%u)\n", drops);
+                    }
+                }
                 m_packetQueue.push(pkt);
             }
             m_packetsReceived++;
         }
         else
         {
-            // No sync header at buffer[0]. Discard one byte and retry.
-            uint8_t b0 = m_accumBuffer[0];
-            uint8_t b1 = m_accumBuffer.size() > 1 ? m_accumBuffer[1] : 0;
-            m_accumBuffer.erase(m_accumBuffer.begin());
-            m_resyncCount++;
-
-            if (m_resyncCount <= 10 || m_resyncCount % 1000 == 0)
+            // No sync header at read_pos. Advance one byte and retry.
+            uint32_t count = ++m_resyncCount;
+            if (count <= 10 || count % 1000 == 0)
             {
                 fprintf(stderr,
                     "SerialReader: resync #%u (expected 0xAA 0x55, got 0x%02X 0x%02X)\n",
-                    m_resyncCount.load(), b0, b1);
+                    count,
+                    m_accumBuffer[read_pos],
+                    (read_pos + 1 < m_accumBuffer.size()) ? m_accumBuffer[read_pos + 1] : 0u);
             }
+            read_pos++;
         }
     }
+
+    // Remove all consumed bytes in one shot.
+    if (read_pos > 0)
+        m_accumBuffer.erase(m_accumBuffer.begin(),
+                            m_accumBuffer.begin() + static_cast<std::ptrdiff_t>(read_pos));
 }
 
 // ============================================================================

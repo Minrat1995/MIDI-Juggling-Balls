@@ -5,15 +5,27 @@
 #include "timing.h"
 #include "nrf.h"
 #include "nrf_delay.h"
+#include "nrf_drv_clock.h"
 
 static volatile uint32_t system_time_ms = 0;
 
 void timing_init(void)
 {
-    NRF_CLOCK->LFCLKSRC = CLOCK_LFCLKSRC_SRC_Xtal << CLOCK_LFCLKSRC_SRC_Pos;
-    NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
-    NRF_CLOCK->TASKS_LFCLKSTART = 1;
-    while (NRF_CLOCK->EVENTS_LFCLKSTARTED == 0);
+    // Request LFCLK via the clock driver rather than writing directly to
+    // NRF_CLOCK->LFCLKSRC / TASKS_LFCLKSTART.
+    //
+    // The USB stack internally requests LFCLK through the same clock driver.
+    // The driver uses reference counting to track all requestors and stops
+    // the clock only when the last one releases it. Direct register writes
+    // bypass this reference counting: if the driver later issues TASKS_LFCLKSTOP
+    // without knowing timing_init() already started the clock, the RTC1
+    // tick interrupt stops and system_time_ms freezes.
+    //
+    // nrf_drv_clock_init() is called in main() before timing_init(), so the
+    // driver is ready. The LFCLK source is set by CLOCK_CONFIG_LF_SRC in
+    // sdk_config.h (must be NRF_CLOCK_LFCLK_Xtal = 1 for the crystal source).
+    nrf_drv_clock_lfclk_request(NULL);
+    while (!nrf_drv_clock_lfclk_is_running()) { /* spin */ }
 
     // PRESCALER=32: f = 32768/(32+1) = 992.97 Hz, period = 1.0071 ms
     // This is a 0.71% systematic undercount — system_time_ms runs slow.

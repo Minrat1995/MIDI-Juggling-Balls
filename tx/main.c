@@ -11,7 +11,7 @@
  *   LSM6DSOX accel/gyro: 416Hz  - 1.66x TX rate, near-full capture
  *   H3LIS331:            400Hz  - 1.6x TX rate, near-full capture
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
- *   LIS3MDL:             80Hz   - TX 3.1x faster, ~every 3rd packet has fresh mag data
+ *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
  *
  * @version 3.4
  *

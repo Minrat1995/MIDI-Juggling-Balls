@@ -185,12 +185,27 @@ int main(int argc, char* argv[])
 
     // Print every Nth packet to avoid flooding the console.
     // At 250Hz this prints ~25 lines/sec — adjust as needed.
-    constexpr uint32_t PRINT_EVERY = 10;
+    // Print one decoded packet block per second (250 packets at 250Hz).
+    // Console output is the main source of main-loop latency; keeping this
+    // low is important for queue health. Once OSC output replaces console
+    // printing this constant becomes irrelevant.
+    constexpr uint32_t PRINT_EVERY = 250;
 
     while (true)
     {
+        // Drain ALL available packets before sleeping.
+        //
+        // Sleep(1) on Windows uses the system timer quantum (~15.6ms by
+        // default), not 1ms. If we process only one packet per wakeup, the
+        // loop runs at ~64Hz and drains ~64 packets/second while the reader
+        // thread produces 250/second — the queue fills in ~2 seconds.
+        //
+        // Draining the full queue on each wakeup means latency is bounded
+        // by one Sleep() call (~15ms worst case), not by queue depth.
+        // At 250Hz, ~4 packets accumulate per 15ms sleep — well within the
+        // 500-entry queue limit.
         radio_packet_t raw;
-        if (reader.TryGetPacket(raw))
+        while (reader.TryGetPacket(raw))
         {
             uint8_t id = raw.ball_id;
             if (id >= 1 && id <= 8)
@@ -212,7 +227,7 @@ int main(int argc, char* argv[])
                             "Decoder: false sync discarded "
                             "(ball=%u seq=%u last=%u gap=%u total_discarded=%u)\n",
                             id, raw.sequence, lastSeq[id], gap, falseSyncs[id]);
-                        continue;  // back to top of while(true)
+                        continue;
                     }
 
                     // Real gap — count as lost packets
@@ -235,7 +250,7 @@ int main(int argc, char* argv[])
                 // OSC output (stub — implement OscSender here)
                 send_osc(decoded);
 
-                // Console output throttled to PRINT_EVERY packets
+                // Console output throttled to one block per second
                 if (printedPackets % PRINT_EVERY == 0)
                     print_packet(decoded);
 
@@ -249,10 +264,11 @@ int main(int argc, char* argv[])
         {
             lastStatsTime = now;
             printf("\n--- Stats ---\n");
-            printf("Serial: %u bytes  %u packets  %u resyncs\n",
+            printf("Serial: %u bytes  %u packets  %u resyncs  %u queue_drops\n",
                    reader.GetBytesReceived(),
                    reader.GetPacketsReceived(),
-                   reader.GetResyncCount());
+                   reader.GetResyncCount(),
+                   reader.GetQueueDropCount());
 
             for (int i = 1; i <= 8; i++)
             {
@@ -267,8 +283,8 @@ int main(int argc, char* argv[])
             printf("\n");
         }
 
-        // Yield to avoid spinning at 100% CPU.
-        // At 250Hz a packet arrives every 4ms so this does not add latency.
+        // Yield to avoid 100% CPU. The full-drain loop above means latency
+        // is not sensitive to how long this sleep actually takes.
         Sleep(1);
     }
 

@@ -3,11 +3,14 @@
  *
  * Streams radio_packet_t structs over USB CDC virtual serial port.
  *
- * USB framing (89 bytes per packet):
- *   [0]    sync byte 0 (0xAA)
- *   [1]    sync byte 1 (0x55)
+ * USB framing (USB_FRAME_SIZE = 89 bytes per packet):
+ *   [0]    sync byte 0 (USB_SYNC_BYTE_0 = 0xAA)
+ *   [1]    sync byte 1 (USB_SYNC_BYTE_1 = 0x55)
  *   [2-87] radio_packet_t payload (86 bytes)
  *   [88]   XOR checksum of bytes [2-87]
+ *
+ * Framing constants (USB_SYNC_BYTE_0/1 and USB_FRAME_SIZE) are defined in
+ * packet_spec.h and must not be redefined here.
  *
  * The checksum is XOR of all 86 payload bytes. On the decoder side,
  * after finding the sync header and extracting the payload, the checksum
@@ -81,8 +84,10 @@ static volatile bool port_open      = false;
 // is still set. At 250Hz (4ms period) with DMA completing in ~1ms this guard
 // is almost never triggered in normal operation. When it is, the dropped
 // packet is indistinguishable from RF packet loss at the decoder.
-#define FRAME_SIZE (2 + sizeof(radio_packet_t) + 1)  // 89 bytes
-static uint8_t          s_tx_frame[FRAME_SIZE];
+//
+// The same s_tx_busy guard applies to usb_serial_send_text(). Both functions
+// share the DMA path and must not overlap.
+static uint8_t          s_tx_frame[USB_FRAME_SIZE];
 static volatile bool    s_tx_busy = false;
 
 // ============================================================================
@@ -256,7 +261,7 @@ bool usb_serial_send_framed_packet(const radio_packet_t *packet,
     // prevents buffer corruption in the event of a timing anomaly.
     if (s_tx_busy) return false;
 
-    // Build the 89-byte frame into the module-level static buffer.
+    // Build the frame into the module-level static buffer.
     //
     // The buffer MUST be static (not a local stack variable). app_usbd_cdc_acm_write
     // is non-blocking: it starts DMA and returns immediately. For frames larger than
@@ -265,11 +270,11 @@ bool usb_serial_send_framed_packet(const radio_packet_t *packet,
     // the stack, the function has already returned and the stack has been reused
     // by the time the second DMA fires, so the last 25 bytes are garbage.
     //
-    // Frame layout:
-    //   [0]    sync0 (0xAA)
-    //   [1]    sync1 (0x55)
-    //   [2-87] radio_packet_t payload (86 bytes)
-    //   [88]   XOR checksum of bytes [2-87]
+    // Frame layout (USB_FRAME_SIZE = 89 bytes):
+    //   [0]         sync0 (USB_SYNC_BYTE_0 = 0xAA)
+    //   [1]         sync1 (USB_SYNC_BYTE_1 = 0x55)
+    //   [2-87]      radio_packet_t payload (86 bytes)
+    //   [88]        XOR checksum of bytes [2-87]
     s_tx_frame[0] = sync0;
     s_tx_frame[1] = sync1;
     memcpy(&s_tx_frame[2], packet, sizeof(radio_packet_t));
@@ -279,10 +284,10 @@ bool usb_serial_send_framed_packet(const radio_packet_t *packet,
     for (size_t i = 0; i < sizeof(radio_packet_t); i++) {
         checksum ^= bytes[i];
     }
-    s_tx_frame[2 + sizeof(radio_packet_t)] = checksum;
+    s_tx_frame[USB_FRAME_SIZE - 1] = checksum;
 
     s_tx_busy = true;
-    ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, s_tx_frame, FRAME_SIZE);
+    ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, s_tx_frame, USB_FRAME_SIZE);
     if (ret != NRF_SUCCESS) {
         s_tx_busy = false;
         return false;
@@ -293,6 +298,17 @@ bool usb_serial_send_framed_packet(const radio_packet_t *packet,
 bool usb_serial_send_text(const char *text)
 {
     if (!usb_serial_ready()) return false;
+
+    // Guard: do not write while a framed-packet DMA is in flight.
+    // Both paths share the same USB endpoint; overlapping writes corrupt
+    // the ongoing transfer. s_tx_busy is cleared by TX_DONE.
+    if (s_tx_busy) return false;
+
+    s_tx_busy = true;
     ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, text, strlen(text));
-    return (ret == NRF_SUCCESS);
+    if (ret != NRF_SUCCESS) {
+        s_tx_busy = false;
+        return false;
+    }
+    return true;
 }

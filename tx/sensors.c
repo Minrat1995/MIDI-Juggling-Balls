@@ -503,8 +503,10 @@ bool sensors_init(void)
 
     // ---- LIS3MDL configuration ----
 
-    // CTRL_REG1: ultra-high perf XY, 80Hz, temp enabled
-    if (!i2c_write_reg(lis3_addr, LIS3_CTRL_REG1, 0xFC)) {
+    // CTRL_REG1: ultra-high perf XY, 155Hz (FAST_ODR enabled), temp enabled
+    // 0xFE = 1111 1110: TEMP_EN=1, OM=11 (UHP), DO=111, FAST_ODR=1 (bit1), ST=00
+    // FAST_ODR=1 with OM=11 (UHP) enables 155Hz. Without FAST_ODR (0xFC), ODR is 80Hz.
+    if (!i2c_write_reg(lis3_addr, LIS3_CTRL_REG1, 0xFE)) {
         SEGGER_RTT_printf(0, "ERROR: LIS3MDL CTRL_REG1 failed\r\n");
         return false;
     }
@@ -523,7 +525,7 @@ bool sensors_init(void)
         SEGGER_RTT_printf(0, "ERROR: LIS3MDL CTRL_REG4 failed\r\n");
         return false;
     }
-    SEGGER_RTT_printf(0, "LIS3MDL: 80Hz, +/-4 gauss, continuous\r\n");
+    SEGGER_RTT_printf(0, "LIS3MDL: 155Hz (FAST_ODR), +/-4 gauss, continuous\r\n");
 
     // ---- H3LIS331 configuration (optional) ----
 

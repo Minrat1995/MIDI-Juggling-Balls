@@ -43,13 +43,31 @@
 // RADIO CONSTANTS
 // ============================================================================
 
-constexpr int     RF_CHANNEL          = 40;
-constexpr uint32_t RADIO_BASE_ADDR    = 0x12345678;
-constexpr uint8_t  RADIO_PREFIX_ADDR  = 0xAB;
-constexpr int     PACKET_PAYLOAD_SIZE = 86;
+constexpr int      RF_CHANNEL          = 40;
+constexpr uint32_t RADIO_BASE_ADDR     = 0x12345678;
+constexpr uint8_t  RADIO_PREFIX_ADDR   = 0xAB;
+constexpr int      PACKET_PAYLOAD_SIZE = 86;
 
 constexpr uint8_t PACKET_TYPE_DATA   = 0x00;
 constexpr uint8_t PACKET_TYPE_STATUS = 0xFF;
+
+// ============================================================================
+// USB FRAMING CONSTANTS
+//
+// These define the wire format between RX firmware (usb_serial.c) and the
+// PC decoder (SerialReader.cpp). All three files must use these definitions.
+// Do not redefine them locally.
+//
+// Frame layout (89 bytes):
+//   [0]      USB_SYNC_BYTE_0 (0xAA)
+//   [1]      USB_SYNC_BYTE_1 (0x55)
+//   [2-87]   radio_packet_t payload (PACKET_PAYLOAD_SIZE = 86 bytes)
+//   [88]     XOR checksum of bytes [2-87]
+// ============================================================================
+
+constexpr uint8_t USB_SYNC_BYTE_0 = 0xAA;
+constexpr uint8_t USB_SYNC_BYTE_1 = 0x55;
+constexpr int     USB_FRAME_SIZE  = 2 + PACKET_PAYLOAD_SIZE + 1;   // 89 bytes
 
 // ============================================================================
 // SENSOR DATA STRUCTURES

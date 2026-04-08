@@ -3,7 +3,7 @@
  *
  * THIS FILE IS IDENTICAL IN tx/ AND rx/ DIRECTORIES.
  * If you change one copy you must change the other.
- * It defines the on-air packet layout and all radio constants.
+ * It defines the on-air packet layout, radio constants, and USB framing constants.
  * Neither TX nor RX should define these independently.
  *
  * Packet: 86 bytes at 250Hz (4ms intervals)
@@ -60,6 +60,24 @@
 // Packet type field values
 #define PACKET_TYPE_DATA        0x00
 #define PACKET_TYPE_STATUS      0xFF
+
+// ============================================================================
+// USB FRAMING CONSTANTS
+//
+// These define the wire format between RX firmware (usb_serial.c) and the
+// PC decoder (SerialReader.cpp). All three files must use these definitions.
+// Do not redefine them locally.
+//
+// Frame layout (89 bytes):
+//   [0]      USB_SYNC_BYTE_0 (0xAA)
+//   [1]      USB_SYNC_BYTE_1 (0x55)
+//   [2-87]   radio_packet_t payload (PACKET_PAYLOAD_SIZE = 86 bytes)
+//   [88]     XOR checksum of bytes [2-87]
+// ============================================================================
+
+#define USB_SYNC_BYTE_0     0xAA
+#define USB_SYNC_BYTE_1     0x55
+#define USB_FRAME_SIZE      (2 + PACKET_PAYLOAD_SIZE + 1)   // 89 bytes
 
 // ============================================================================
 // SENSOR DATA STRUCTURES

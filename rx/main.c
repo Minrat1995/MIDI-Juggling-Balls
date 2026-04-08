@@ -14,9 +14,21 @@
  *   sync alignment produces garbage payload data which fails the checksum,
  *   allowing the decoder to discard it and resync cleanly.
  *
+ *   Sync bytes and frame size are defined in packet_spec.h (USB_SYNC_BYTE_0,
+ *   USB_SYNC_BYTE_1, USB_FRAME_SIZE) and must not be redefined here or in
+ *   usb_serial.c.
+ *
  * Data flow:
  *   Radio ISR -> rx_packet buffer -> main loop copy -> USB CDC (89 bytes) -> C++ decoder
  *                                                   -> RTT (decoded, 1Hz)
+ *
+ * Single-buffer overwrite risk:
+ *   The radio ISR fires every 4ms and overwrites rx_packet unconditionally.
+ *   If the main loop takes longer than 4ms between radio_packet_available()
+ *   checks, the previous packet is silently lost with no counter. The main
+ *   risk is packet_processor_print_statistics() blocking on a full RTT buffer.
+ *   usb_tx_drop_count tracks USB TX failures only — it does NOT catch
+ *   ISR overwrites. Phase 3 requires a ring buffer to eliminate this risk.
  *
  * Phase 1 validation checklist (RTT on RX):
  *   1. "Ball 1 first packet" appears when TX is powered on
@@ -59,13 +71,8 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 
 #define STATS_INTERVAL_MS   1000    // Print stats and decoded sensors every second
 
-// Two-byte sync marker prepended to every USB packet.
-// 0xAA 0x55 cannot be mistaken for a valid ball_id (1-8) at byte 0,
-// and the two-byte sequence reduces false-positive alignment to 1/65536.
-// An XOR checksum byte is appended after the payload for validation.
-// Must match SYNC_BYTE_1/2 and checksum logic in SerialReader.cpp.
-#define USB_SYNC_BYTE_0     0xAA
-#define USB_SYNC_BYTE_1     0x55
+// USB_SYNC_BYTE_0, USB_SYNC_BYTE_1, and USB_FRAME_SIZE are defined in
+// packet_spec.h (included via radio_rx.h -> packet_spec.h).
 
 int main(void)
 {
@@ -75,6 +82,9 @@ int main(void)
     // Count USB TX drops: incremented when usb_serial_send_framed_packet()
     // returns false (TX buffer busy or port not ready). Printed in the 1Hz
     // stats block so USB drops are distinguishable from RF packet loss.
+    // Note: drops before the host opens the port (at startup) are expected
+    // and not meaningful. In normal operation with the port open, any
+    // rising count indicates a TX buffer busy condition.
     uint32_t usb_tx_drop_count = 0;
 
     // Initialise the clock driver. This must happen before anything that
@@ -93,7 +103,8 @@ int main(void)
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n", sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n", sizeof(sensor_data_t));
-    SEGGER_RTT_printf(0, "  USB frame:      89 bytes (2 sync + 86 payload + 1 checksum)\r\n\r\n");
+    SEGGER_RTT_printf(0, "  USB frame:      %u bytes (2 sync + 86 payload + 1 checksum)\r\n\r\n",
+                      (unsigned)USB_FRAME_SIZE);
     SEGGER_RTT_printf(0, "Channel: %d (%d MHz)\r\n", RF_CHANNEL, 2400 + RF_CHANNEL);
     SEGGER_RTT_printf(0, "Listening for up to %d balls\r\n\r\n", MAX_BALLS);
 
@@ -138,17 +149,17 @@ int main(void)
             uint32_t rx_time = get_timestamp_ms();
             packet_processor_process(&local_packet, rx_time);
 
-            // Forward to USB: 0xAA 0x55 + 86 payload bytes + 1 XOR checksum = 89 bytes.
-            // Checksum is computed inside usb_serial_send_framed_packet().
-            // Track drops: a false return means the TX buffer was busy or the port
-            // was not ready. The decoder sees this as a sequence gap identical to
-            // RF packet loss — usb_tx_drop_count separates the two causes.
-            if (usb_serial_ready()) {
-                if (!usb_serial_send_framed_packet(&local_packet,
-                                                   USB_SYNC_BYTE_0,
-                                                   USB_SYNC_BYTE_1)) {
-                    usb_tx_drop_count++;
-                }
+            // Forward to USB. usb_serial_send_framed_packet() handles all guard
+            // conditions internally (port not open, TX buffer busy). Count all
+            // false returns; drops before the host opens the port are expected
+            // at startup. In normal operation, a rising count means the TX
+            // buffer is consistently full — primary cause is
+            // APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE too small (must be >=89,
+            // set to 256 in sdk_config.h).
+            if (!usb_serial_send_framed_packet(&local_packet,
+                                               USB_SYNC_BYTE_0,
+                                               USB_SYNC_BYTE_1)) {
+                usb_tx_drop_count++;
             }
         }
 
@@ -160,11 +171,6 @@ int main(void)
         if (now - last_stats_time >= STATS_INTERVAL_MS) {
             last_stats_time = now;
             packet_processor_print_statistics();
-
-            // USB drop count printed here so USB vs RF loss are distinguishable.
-            // A rising usb_tx_drop_count with low RF loss means the USB TX buffer
-            // is consistently full — the primary cause is APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE
-            // being too small (must be >= 89, set to 256 in sdk_config.h).
             SEGGER_RTT_printf(0, "USB TX drops: %lu\r\n", usb_tx_drop_count);
         }
 

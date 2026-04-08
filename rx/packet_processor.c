@@ -47,16 +47,10 @@ static decoded_sensors_t last_decoded[MAX_BALLS];
 
 static void decode_sensor_data(const sensor_data_t *d, decoded_sensors_t *out)
 {
-    // IMU: direct copy from packet
-    out->accel[0] = d->imu.accel[0];
-    out->accel[1] = d->imu.accel[1];
-    out->accel[2] = d->imu.accel[2];
-    out->gyro[0]  = d->imu.gyro[0];
-    out->gyro[1]  = d->imu.gyro[1];
-    out->gyro[2]  = d->imu.gyro[2];
-    out->mag[0]   = d->imu.mag[0];
-    out->mag[1]   = d->imu.mag[1];
-    out->mag[2]   = d->imu.mag[2];
+    // IMU: bulk copy each array rather than element-by-element assignment.
+    memcpy(out->accel, d->imu.accel, sizeof(out->accel));
+    memcpy(out->gyro,  d->imu.gyro,  sizeof(out->gyro));
+    memcpy(out->mag,   d->imu.mag,   sizeof(out->mag));
 
     // H3LIS331: sensor value is in bits [15:4], FSR data in bits [3:0].
     // extract_h3lis_axis() uses unsigned right shift (well-defined in C) then

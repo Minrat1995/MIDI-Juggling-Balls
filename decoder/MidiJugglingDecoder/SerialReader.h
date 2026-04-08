@@ -11,11 +11,21 @@
  * if you need to disambiguate.
  *
  * USB CDC does not guarantee 86-byte aligned reads. A background thread
- * accumulates raw bytes and extracts complete packets. Alignment is
- * validated by checking that ball_id is in range [1,8]. On misalignment
- * the buffer is shifted one byte at a time until a valid start is found.
- * Misalignment is rare in normal operation but can occur at startup or
- * after a port glitch.
+ * accumulates raw bytes and extracts complete packets using the 0xAA 0x55
+ * sync header and XOR checksum defined in packet_spec.h. Sync and framing
+ * constants come from packet_spec.h (USB_SYNC_BYTE_0/1, USB_FRAME_SIZE).
+ *
+ * On misalignment, the buffer is advanced one byte at a time until a valid
+ * sync header and matching checksum are found. Misalignment is rare in
+ * normal operation but can occur at startup or after a port glitch.
+ *
+ * Packet queue:
+ *   Extracted packets are queued up to MAX_QUEUE_DEPTH entries. If the
+ *   consumer (main loop) falls behind and the queue fills, the oldest
+ *   packet is dropped to make room for the newest. GetQueueDropCount()
+ *   returns the total number of drops since Open(). During single-ball
+ *   operation this should remain zero; a non-zero count during multi-ball
+ *   testing indicates the consumer loop cannot keep up.
  *
  * TryGetPacket() is safe to call from any thread.
  *
@@ -93,6 +103,14 @@ public:
     uint32_t GetPacketsReceived() const { return m_packetsReceived.load(); }
     uint32_t GetResyncCount()     const { return m_resyncCount.load(); }
 
+    /**
+     * Number of packets dropped from the queue because the consumer loop
+     * fell behind. Should remain zero during single-ball operation.
+     * A non-zero count during multi-ball testing means the main loop's
+     * Sleep(1) / processing budget is insufficient for the incoming rate.
+     */
+    uint32_t GetQueueDropCount()  const { return m_queueDropCount.load(); }
+
 private:
     void ReaderThread();
     void ProcessBytes(const uint8_t* data, size_t len);
@@ -111,7 +129,14 @@ private:
     std::atomic<uint32_t> m_bytesReceived  { 0 };
     std::atomic<uint32_t> m_packetsReceived{ 0 };
     std::atomic<uint32_t> m_resyncCount    { 0 };
+    std::atomic<uint32_t> m_queueDropCount { 0 };
 
     static constexpr size_t PACKET_SIZE      = sizeof(radio_packet_t); // 86
     static constexpr size_t MAX_ACCUM_BUFFER = 4096; // ~47 packets; runaway guard
+
+    // Queue depth limit. At 250Hz, 500 entries = 2 seconds of backlog.
+    // When full, the oldest packet is dropped to admit the newest.
+    // Reviewed at Phase 3 multi-ball transition: 3 balls at 250Hz each =
+    // 750Hz arrival rate, so the same 500-entry limit covers ~0.67s.
+    static constexpr size_t MAX_QUEUE_DEPTH  = 500;
 };
