@@ -11,7 +11,10 @@
  * Header (5 bytes):
  *   ball_id   uint8_t   Ball identifier 1-8
  *   sequence  uint16_t  Wraps at 65535
- *   timestamp uint16_t  Milliseconds since TX boot, wraps at 65.5s
+ *   timestamp uint16_t  RTC ticks since TX boot, wraps at ~65535 ticks (~66.0s)
+ *                       NOTE: ticks, not true milliseconds. RTC1 runs at 32768/33
+ *                       = 992.97 Hz; each tick = ~1.007ms. For gap-fill interpolation
+ *                       treat as ticks. Wrap is ~66.0s, not 65.5s.
  *
  * Data (81 bytes):
  *   data_t0   sensor_data_t (27 bytes)  Current sample
@@ -44,7 +47,6 @@
 #define PACKET_SPEC_H
 
 #include <stdint.h>
-#include <stdbool.h>
 
 // ============================================================================
 // RADIO CONSTANTS (must match on both TX and RX)
@@ -53,7 +55,11 @@
 #define RF_CHANNEL              40          // 2440 MHz
 #define RADIO_BASE_ADDR         0x12345678
 #define RADIO_PREFIX_ADDR       0xAB
-#define CRC_POLYNOMIAL          0x00065B    // IBM CRC-24
+#define CRC_POLYNOMIAL          0x00065B    // Nordic nRF proprietary radio CRC-24
+                                            // NOTE: this is NOT IBM CRC-24 (0x864CFB).
+                                            // Using the wrong polynomial for any
+                                            // independent CRC implementation will
+                                            // produce no matches.
 #define CRC_INIT_VALUE          0x555555
 #define PACKET_PAYLOAD_SIZE     86          // Total bytes on air
 
@@ -131,7 +137,8 @@ _Static_assert(sizeof(sensor_data_t) == 27, "sensor_data_t must be 27 bytes");
 typedef struct {
     uint8_t       ball_id;    // 1-8
     uint16_t      sequence;   // wraps at 65535
-    uint16_t      timestamp;  // TX milliseconds, wraps at 65.5s
+    uint16_t      timestamp;  // RTC ticks since TX boot; wraps at ~65535 ticks (~66.0s).
+                              // Each tick = ~1.007ms (RTC1 at 992.97 Hz). NOT true ms.
     sensor_data_t data_t0;    // current sample
     sensor_data_t data_t1;    // t-4ms
     sensor_data_t data_t2;    // t-8ms
