@@ -26,9 +26,31 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
 
 #include "packet_spec.h"
 #include "SerialReader.h"
+
+// ============================================================================
+// CLEAN SHUTDOWN (Ctrl+C)
+//
+// The default Ctrl+C handler calls ExitProcess(), which does not run C++
+// destructors. SerialReader::~SerialReader() would never fire, so the reader
+// thread would be killed mid-operation without joining and the COM port HANDLE
+// would not be released cleanly.
+//
+// This handler sets g_running = false instead. The main loop checks it each
+// iteration and exits normally, allowing reader to go out of scope and its
+// destructor to call Close() — joining the reader thread and releasing the port.
+// ============================================================================
+
+static std::atomic<bool> g_running{ true };
+
+static BOOL WINAPI CtrlHandler(DWORD /*ctrlType*/)
+{
+    g_running = false;
+    return TRUE;  // suppress default ExitProcess handler
+}
 
 // ============================================================================
 // DECODED SENSOR VALUES (physical units)
@@ -38,7 +60,7 @@ struct DecodedPacket
 {
     uint8_t  ball_id;
     uint16_t sequence;
-    uint16_t timestamp_ms;
+    uint16_t timestamp_ticks;   // RTC ticks, NOT milliseconds — see packet_spec.h note
 
     // t0 (current sample) decoded to physical units
     float accel_g[3];       // LSM6DSOX, g
@@ -54,7 +76,7 @@ static void decode_packet(const radio_packet_t& raw, DecodedPacket& out)
 {
     out.ball_id      = raw.ball_id;
     out.sequence     = raw.sequence;
-    out.timestamp_ms = raw.timestamp;
+    out.timestamp_ticks = raw.timestamp;
 
     const sensor_data_t& s = raw.data_t0;
 
@@ -103,8 +125,8 @@ static void send_osc(const DecodedPacket& /*pkt*/)
 
 static void print_packet(const DecodedPacket& p)
 {
-    printf("Ball %d | seq=%5u | ts=%5u ms\n",
-           p.ball_id, p.sequence, p.timestamp_ms);
+    printf("Ball %d | seq=%5u | ts=%5u ticks\n",
+           p.ball_id, p.sequence, p.timestamp_ticks);
 
     printf("  ACCEL  %+6.2fg %+6.2fg %+6.2fg\n",
            p.accel_g[0], p.accel_g[1], p.accel_g[2]);
@@ -174,6 +196,8 @@ int main(int argc, char* argv[])
     printf("\nListening for packets. Press Ctrl+C to stop.\n");
     printf("Expected at rest: ACCEL ~1g on one axis, BMP ~101325 Pa\n\n");
 
+    SetConsoleCtrlHandler(CtrlHandler, TRUE);
+
     // --- Main loop ---
     uint32_t printedPackets = 0;
     uint32_t lastStatsTime  = GetTickCount();
@@ -191,7 +215,7 @@ int main(int argc, char* argv[])
     // printing this constant becomes irrelevant.
     constexpr uint32_t PRINT_EVERY = 250;
 
-    while (true)
+    while (g_running)
     {
         // Drain ALL available packets before sleeping.
         //
@@ -264,7 +288,8 @@ int main(int argc, char* argv[])
         {
             lastStatsTime = now;
             printf("\n--- Stats ---\n");
-            printf("Serial: %u bytes  %u packets  %u resyncs  %u queue_drops\n",
+            printf("Serial: %u bytes  %u packets  %u resync_events  %u queue_drops\n"
+                   "  (resync_events counts individual misaligned bytes, not dropped packets)\n",
                    reader.GetBytesReceived(),
                    reader.GetPacketsReceived(),
                    reader.GetResyncCount(),
@@ -288,6 +313,7 @@ int main(int argc, char* argv[])
         Sleep(1);
     }
 
+    printf("\nShutting down...\n");
     reader.Close();
     return 0;
 }

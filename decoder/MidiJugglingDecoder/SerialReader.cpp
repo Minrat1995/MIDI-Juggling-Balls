@@ -99,9 +99,12 @@ static std::string ScanDeviceInfoSet(HDEVINFO devInfo, uint16_t vid)
         char  portName[32] = {};
         DWORD size = sizeof(portName) - 1;
         DWORD type = REG_SZ;
-        RegQueryValueExA(hKey, "PortName", nullptr, &type,
-                         reinterpret_cast<LPBYTE>(portName), &size);
+        LONG regResult = RegQueryValueExA(hKey, "PortName", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(portName), &size);
         RegCloseKey(hKey);
+
+        if (regResult != ERROR_SUCCESS)
+            continue;
 
         if (strncmp(portName, "COM", 3) == 0)
         {
