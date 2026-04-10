@@ -1,6 +1,6 @@
 # MIDI Juggling Balls — Project Reference
 
-**Version:** Post cleanup session (TX v3.4, RX v1.5, Decoder v1.5, full pipeline validated clean)
+**Version:** Post code-review session (TX v3.5, RX v1.5, Decoder v1.5, full pipeline validated clean)
 **Goal:** Wireless juggling ball → sensor data → sound reinforcing visual performance
 **Repo:** https://github.com/Minrat1995/MIDI-Juggling-Balls (private)
 **Target:** <20ms perceived latency, <1% packet loss, scalable to 3+ balls
@@ -10,7 +10,7 @@
 ## CURRENT STATUS
 
 ### What is done
-- TX firmware v3.4: all sensors validated on hardware, 250Hz confirmed stable, radio recovery cascade fixed
+- TX firmware v3.5: all sensors validated on hardware, 250Hz confirmed stable, radio recovery cascade fixed
 - RX firmware v1.5: end-to-end radio validated, ~1-2% RF packet loss benchtop (see RF Loss Pattern below)
 - USB framing: confirmed working end-to-end. 0 resyncs, decoder queue drops = 0
 - C++ decoder: auto-detects COM14 via SERIALCOMM registry fallback, decodes to correct physical values
@@ -18,6 +18,9 @@
 - LIS3MDL confirmed running at 155Hz (FAST_ODR, CTRL_REG1=0xFE)
 - All sensors confirmed at startup: LSM6=0x6A LIS3=0x1C H3LIS=0x18 BMP=0x46 (CHIP_ID=0x50)
 - Decoder drain-loop fix confirmed: queue_drops=0 in steady state
+- Code review fixes applied in v3.5 (see BUGS FIXED): h3lis failure counter wrap,
+  temperature sign extension, H3LIS zero-on-failure, uptime divide accuracy,
+  sensor config named constants, fsr_read guard pattern
 
 ### Immediate next tasks
 1. Implement OSC output in decoder (stub already in place)
@@ -119,11 +122,16 @@ all three copies must be updated.
 ```
 ball_id    uint8_t   Ball 1-8
 sequence   uint16_t  Wraps at 65535
-timestamp  uint16_t  TX milliseconds, wraps at 65.5s
+timestamp  uint16_t  RTC ticks since TX boot, wraps at ~65535 ticks (~66.0s)
 data_t0    27 bytes  Current sample
 data_t1    27 bytes  t-4ms
 data_t2    27 bytes  t-8ms
 ```
+
+Note on timestamp field: the field is named "milliseconds" for convenience but
+carries raw RTC ticks. RTC1 runs at 32768/33 = 992.97 Hz, so each tick is
+~1.007ms and the counter wraps at ~66.0s (not 65.5s). For Phase 2 t1/t2
+gap-fill interpolation, treat the field as ticks, not true milliseconds.
 
 ### sensor_data_t: 27 bytes
 ```
@@ -160,7 +168,9 @@ radio_timeouts (uint16), i2c_errors (uint16), reserved (uint8), checksum (uint8 
 ```
 
 Temperature field: SENSORS_TEMP_UNAVAILABLE (-32768) means BMP581 absent.
-Firmware stores 0 in status packet when unavailable to avoid confusing display.
+Firmware stores 0 in status packet when BMP581 is unavailable to avoid displaying
+-327.68°C. Decoders must use the SENSOR_BMP_OK bit in sensor_health to distinguish
+"0 degrees C" from "BMP absent" — the temperature field alone is ambiguous.
 Status packets are RTT-only and are never forwarded over USB.
 
 ---
@@ -182,43 +192,55 @@ Shortcuts:   READY→START, END→DISABLE, DISABLED→RXEN (RX auto-loop)
 ## SENSOR CONFIGURATION
 
 ### LSM6DSOX
-- CTRL1_XL = 0x66: 416Hz ODR, +/-16g
-- CTRL2_G  = 0x64: 416Hz ODR, +/-500dps
-- CTRL3_C  = 0x44: BDU enabled, IF_INC enabled
+- CTRL1_XL = 0x66 (LSM6_CTRL1_XL_VAL): 416Hz ODR, +/-16g
+- CTRL2_G  = 0x64 (LSM6_CTRL2_G_VAL): 416Hz ODR, +/-500dps
+  - **0x68 = +/-1000dps — do NOT use. Was a silent bug for multiple sessions.**
+- CTRL3_C  = 0x44 (LSM6_CTRL3_C_VAL): BDU enabled, IF_INC enabled
 - Auto-increment on I2C burst reads (no special flag needed)
 
 ### LIS3MDL
-- CTRL_REG1 = 0xFE: ultra-high perf XY, 155Hz (FAST_ODR=1), temp enabled
+- CTRL_REG1 = 0xFE (LIS3_CTRL_REG1_VAL): ultra-high perf XY, 155Hz (FAST_ODR=1), temp enabled
   - Changed from 0xFC (80Hz). FAST_ODR is bit 1; setting it with OM=11 (UHP) enables 155Hz.
+  - **0xFC = 80Hz — do NOT use.**
 - CTRL_REG2 = 0x00: +/-4 gauss
 - CTRL_REG3 = 0x00: continuous conversion
 - CTRL_REG4 = 0x0C: ultra-high perf Z, little-endian
 - **Requires | 0x80 on register address for multi-byte I2C burst reads**
-- Effective output rate: 155Hz. At 250Hz TX polling, ~every 1.6 packets has fresh mag data (was every 3rd at 80Hz)
+- Effective output rate: 155Hz. At 250Hz TX polling, ~every 1.6 packets has fresh mag data
 - Duplicate mag readings in packet stream are normal and harmless
 
 ### H3LIS331
-- CTRL_REG1 = 0x37: normal mode, 400Hz, all axes
-- CTRL_REG4 = 0xB0: BDU enabled, +/-400g
+- CTRL_REG1 = 0x37 (H3LIS_CTRL_REG1_VAL): normal mode, 400Hz, all axes
+- CTRL_REG4 = 0xB0 (H3LIS_CTRL_REG4_VAL): BDU enabled, +/-400g
 - **Requires | 0x80 on register address for multi-byte I2C burst reads**
+- **No register readback verification in sensors_init()** (unlike radio_init and BMP581).
+  A silent CTRL_REG4 write failure sets a wrong range without detection.
+  Low risk on stable hardware; consider adding readback checks before Phase 2 extended testing.
 
 ### BMP581
 - On-chip compensation — outputs pre-compensated data directly
 - Pa = raw_register_value / 64 (no polynomial, no NVM reads needed)
-- **OSR_CONFIG = 0x52**: pressure x4, temp x4 oversampling
+- **OSR_CONFIG = 0x52 (BMP_OSR_CONFIG_VAL)**: pressure x4, temp x4 oversampling
   - Bit 6 (PRESS_EN) MUST be 1. Without it pressure registers return 0x7F7F7F.
-  - 0x12 (PRESS_EN=0) was the original value — confirmed broken on hardware.
-- ODR_CONFIG = 0x11: normal mode ~218Hz
+  - **0x12 (PRESS_EN=0) was the original value — confirmed broken on hardware. Do NOT use.**
+- ODR_CONFIG = 0x11 (BMP_ODR_CONFIG_VAL): normal mode ~218Hz
 - Temp: raw / 65536 = C; firmware stores as int16 in 0.01C units
 - NVM error flag (STATUS bit 1) is observed on known-good Adafruit units.
   It does not prevent correct operation — do not treat as fatal.
 - Decoupling cap (100nF) required on VDD for reliable NVM load at power-on.
+- Register readback verified in init_bmp581() after writing OSR_CONFIG and ODR_CONFIG.
 
 ### SAADC
 - Channel 0: battery (P0.31 AIN7, 12-bit, owned by main.c)
 - Channels 1-4: FSR0-3 (configured but disabled until Phase 3 wiring)
 - **FSR reads must save/restore 12-bit resolution — FSR calibration is 10-bit**
 - FSR_CONTACT_THRESHOLD = 80, intensity >> 6 scaling: calibrated for 10-bit ADC
+
+### runtime_sensor_status behavior
+SENSOR_LSM6_OK is cleared on any single I2C read failure during sensors_read()
+(gyro read or accel read), even if the other succeeded. A transient I2C blip
+therefore appears as "sensor failed" in the status packet. This is known behavior,
+not a bug. Status packets include i2c_errors for correlation.
 
 ---
 
@@ -278,7 +300,7 @@ MIDI (discrete events, Phase 2):
 
 After flashing TX, connect J-Link and open RTT terminal. Expected startup:
 ```
-=== Juggling Ball TX (Ball 1) v3.4 ===
+=== Juggling Ball TX (Ball 1) v3.5 ===
 Packet sizes:
   radio_packet_t: 86 (expect 86)      <- must match
   sensor_data_t:  27 (expect 27)      <- must match
@@ -394,6 +416,18 @@ Acceptable benchtop results:
 | usb_serial_send_framed_packet return value discarded (RX) | main.c (RX) | USB TX drops invisible; added usb_tx_drop_count with RTT output |
 | usb_serial.c CDC ACM buffer size uninstrumented (RX) | usb_serial.c | No runtime confirmation of compiled value; added RTT print (since removed once confirmed) |
 | USB CDC TX buffer too small for 89-byte frame | sdk_config.h | **FIXED** — APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256 |
+| SEGGER_RTT_CONFIG_DEFAULT_MODE undefined in sdk_config.h (TX) | sdk_config.h (TX) | SEGGER_RTT_Conf.h used symbol with no fallback; compiler resolved to 0 by luck. Fix: full SEGGER_RTT_CONFIG section added to sdk_config.h |
+| read_battery_voltage() bare polling loops (TX) | main.c (TX) | No timeout guards; SAADC hang would block indefinitely. Fix: 100000-iteration countdown, return 0 on timeout |
+| Status interval check used 32-bit divide at 250Hz (TX) | main.c (TX) | get_uptime_seconds() divided COUNTER/1000 every loop. Fix: STATUS_INTERVAL_TICKS direct RTC comparison |
+| H3LIS331 burst-read fallback unbounded (TX) | sensors.c (TX) | On burst failure, 6 single-byte reads added ~1.5ms unpredictable latency at tightest timing point. Fix: suppress fallback after 3 consecutive failures, write zeros instead |
+| clear_bus_init = false in TWI config (TX) | sensors.c (TX) | SDA stuck low after abnormal reset would cause sensors_init() to fail on next boot. Fix: true — driver clocks bus free at init |
+| h3lis_consecutive_failures uint8_t wrap (TX) | sensors.c (TX) | Counter wraps to 0 at 255 (~1s at 250Hz), re-enabling fallback reads and defeating suppression. Fix: cap increment at SUPPRESS_AFTER+1 |
+| sensors_read_temperature sign extension UB (TX) | sensors.c (TX) | (int32_t)0xFF000000 exceeds INT_MAX; implementation-defined in C99/C11. Fix: ~(int32_t)0x00FFFFFF (well-defined, identical result) |
+| memset(&h3lis_x_fsr_level, 0, 6) fragile (TX) | sensors.c (TX) | Relies on three H3LIS fields being contiguous at exact offset; silent breakage if struct changes. Fix: explicit per-field assignment |
+| fsr_read() C block comment guard (TX) | sensors.c (TX) | Partial uncomment could activate code without removing early return. Fix: #if 0 / #endif with explicit removal instruction |
+| Sensor config register values inline magic bytes (TX) | sensors.c (TX) | Range/ODR changes require byte reconstruction; previous 0x68/0x64 confusion caused multi-session bug. Fix: named constants (LSM6_CTRL2_G_VAL etc.) |
+| get_uptime_seconds() divide by 1000 (TX) | main.c (TX) | RTC1 at 993Hz not 1000Hz; uptime read 0.71% fast (~12.8s/30min). Fix: divide by RTC1_TICKS_PER_SEC=993 |
+| timing_init() delay uncommented (TX) | main.c (TX) | 10ms delay purpose unclear; could be deleted by mistake. Fix: comment added explaining counter advance before first get_timestamp_ms() call |
 
 ---
 
@@ -454,6 +488,7 @@ copy /Y %TX_SDK%\main.c        tx\
 copy /Y %TX_SDK%\sensors.c     tx\
 copy /Y %TX_SDK%\sensors.h     tx\
 copy /Y %TX_SDK%\packet_spec.h tx\
+copy /Y C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_tx\pca10056\blank\config\sdk_config.h tx\
 
 :: Copy RX files from SDK into repo
 copy /Y %RX_SDK%\main.c              rx\
@@ -510,7 +545,12 @@ Must be committed with any firmware changes.
 - Calibration stored in flash (layout reserved)
 - MIDI discrete events: impact note triggers, FSR contact transitions
 - Decision point: if packet loss >1% in performance conditions, implement t1/t2 gap-fill
+  - Note: packet timestamp field carries RTC ticks (not true ms); interpolation must use
+    tick units. 4ms interval = 4 ticks at 993Hz TX polling.
 - **Investigate TX freeze (I2C TWI driver hang) before extended testing**
+- **Consider adding register readback verification for H3LIS CTRL_REG4 and LSM6 CTRL2_G**
+  before extended testing — silent write failures at wrong range would produce plausible but
+  incorrect sensor data.
 
 ### Phase 3: Multi-ball (3 balls simultaneous)
 - Ring buffer required in RX before running 250Hz x 3 balls (4-entry minimum)
@@ -591,7 +631,7 @@ Workaround: restart TX. Before restarting, note whether TX RTT is also silent
 (confirms TX-side cause vs RX radio ISR failure).
 
 ### BMP581 shows 0 Pa or 130557 Pa (0x7F7F7F)
-1. Check OSR_CONFIG readback in RTT — must be 0x52, not 0x12
+1. Check OSR_CONFIG readback in RTT — must be 0x52 (BMP_OSR_CONFIG_VAL), not 0x12
 2. PRESS_EN (bit 6) must be set. 0x12 leaves it 0 — pressure never runs
 3. Check SDO wire to GND (fixes address at 0x46)
 4. Fit 100nF decoupling cap on VDD if not already present
@@ -642,14 +682,20 @@ Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
 - **usb_serial frame buffer is static.** Do not change it back to a local variable — DMA reads it after the function returns (second USB bulk packet fires after function exit).
 - **usb_serial_send_text() checks s_tx_busy.** Both send paths share the USB endpoint; overlapping writes corrupt the transfer.
 - **RX LFCLK via nrf_drv_clock_lfclk_request(), not direct registers.** Direct writes bypass driver reference counting and can cause RTC1 to stop if the USB stack releases LFCLK.
-- **BMP581 OSR_CONFIG must be 0x52.** Bit 6 = PRESS_EN. 0x12 = pressure disabled.
+- **BMP581 OSR_CONFIG must be 0x52 (BMP_OSR_CONFIG_VAL).** Bit 6 = PRESS_EN. 0x12 = pressure disabled.
 - **BMP581 NVM error is normal.** Observed on all tested Adafruit units. Not a fault.
 - **BMP581 needs 100nF decoupling cap on VDD.** Required for reliable power-on.
 - **BMP581: pa = raw/64.** On-chip compensation. No NVM, no polynomial.
-- **LIS3MDL CTRL_REG1 = 0xFE (155Hz, FAST_ODR=1).** Previous value 0xFC = 80Hz. Burst read needs | 0x80. LSM6DSOX does not. H3LIS331 also needs | 0x80.
+- **LIS3MDL CTRL_REG1 = 0xFE (LIS3_CTRL_REG1_VAL, 155Hz, FAST_ODR=1).** Previous value 0xFC = 80Hz. Burst read needs | 0x80. LSM6DSOX does not. H3LIS331 also needs | 0x80.
+- **LSM6 CTRL2_G = 0x64 (LSM6_CTRL2_G_VAL, +/-500dps).** 0x68 = +/-1000dps. This was a silent multi-session bug. Use the named constant.
 - **Gyro is +/-500dps.** Decoder and Pure Data must use this for scaling.
 - **H3LIS is +/-400g.** Do not confuse with LSM6 +/-16g scale.
 - **H3LIS decode: use extract_h3lis_axis().** Do not use arithmetic right shift.
+- **Sensor config values are named constants in sensors.c** (LSM6_CTRL1_XL_VAL, LSM6_CTRL2_G_VAL, etc.). Use these when modifying ODR or range. Do not reconstruct bytes manually.
+- **Packet timestamp field carries RTC ticks, not true milliseconds.** RTC1 runs at 993Hz; each tick = ~1.007ms. For Phase 2 gap-fill interpolation, treat as ticks. Counter wraps at ~66.0s.
+- **get_uptime_seconds() divides by RTC1_TICKS_PER_SEC = 993**, not 1000. The old divide-by-1000 made uptime run 0.71% fast. If you see this constant changed back to 1000, revert it.
+- **runtime_sensor_status SENSOR_LSM6_OK clears on any single I2C read failure** during sensors_read(). A transient blip appears as "sensor failed" in the status packet. This is normal — correlate with i2c_errors count.
+- **H3LIS and LSM6 register init is not readback-verified** (unlike radio_init and BMP581). Plan to add before Phase 2 extended testing.
 - **OSC is primary protocol.** MIDI only for discrete events.
 - **USB init is non-fatal on RX.** RTT validation works without USB.
 - **TX does not need J-Link to transmit.** USB power is sufficient after flashing.

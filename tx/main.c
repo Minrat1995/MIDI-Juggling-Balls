@@ -13,7 +13,18 @@
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
  *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
  *
- * @version 3.4
+ * @version 3.5
+ *
+ * Changelog from 3.4:
+ *   - RTC1_TICKS_PER_SEC constant added (993). get_uptime_seconds() was dividing
+ *     COUNTER by 1000; RTC1 runs at 32768/33 = 992.97 Hz so uptime read 0.71%
+ *     fast (12.8s ahead after 30 minutes). Dividing by 993 reduces error to
+ *     <0.003%.
+ *   - get_timestamp_ms() comment clarified: the function returns RTC ticks, not
+ *     true milliseconds. Each tick is ~1.007ms (993Hz). The 0.71% slow rate
+ *     means the counter wraps at ~66.0s, not 65.5s. For Phase 2 t1/t2 gap-fill
+ *     interpolation, treat the packet timestamp field as ticks, not ms.
+ *   - timing_init() nrf_delay_ms(10) comment added.
  *
  * Changelog from 3.3:
  *   - radio_init(): power cycle delay increased 10us -> 1ms. 10us was empirically
@@ -58,6 +69,10 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 
 #define TX_INTERVAL_MS          4           // 250Hz
 #define STATUS_INTERVAL_SEC     120         // Status packet every 2 minutes
+// RTC1 runs at 32768/(PRESCALER+1) = 32768/33 = 992.97 Hz.
+// STATUS_INTERVAL_TICKS avoids a 32-bit divide in the hot loop.
+// Slight inaccuracy (~0.71%) matches the existing clock note above.
+#define STATUS_INTERVAL_TICKS   ((STATUS_INTERVAL_SEC * 32768U) / 33U)  // ~119156
 
 #define BATTERY_SHUTDOWN_MV     3300
 #define TEMP_EMERGENCY_SHUTDOWN 6000        // 60.00 C in 0.01 C units
@@ -98,12 +113,22 @@ static uint32_t total_packets_sent = 0;
 // TIMING  (RTC1, ~1ms ticks)
 //
 // PRESCALER=32: f = 32768/(32+1) = 992.97 Hz, period = 1.0071 ms
-// This is a 0.71% systematic undercount — system_time_ms runs slow by ~0.71%.
-// Over 30 minutes, the counter reads ~12.8 seconds behind wall time.
-// This does not affect radio timing (hardware), packet loss stats,
-// or any real-time decisions. It only affects long-duration elapsed time
-// readings if those are ever compared against wall time.
+//
+// RTC1_TICKS_PER_SEC: 993 is the closest integer to 992.97.
+//   - get_timestamp_ms() uses the raw counter and returns TICKS, not true
+//     milliseconds. Each tick is ~1.007ms. The packet timestamp field is named
+//     "milliseconds" for convenience but callers that care about precision
+//     (e.g. Phase 2 t1/t2 gap-fill interpolation) must treat it as ticks.
+//     The counter wraps at ~65535 ticks = ~66.0s (not 65.5s).
+//   - get_uptime_seconds() divides by RTC1_TICKS_PER_SEC = 993, giving <0.003%
+//     error. The previous value of 1000 caused 0.71% fast readout (~12.8s
+//     ahead after 30 minutes).
+//   - This 0.71% rate does not affect radio timing (hardware), packet loss
+//     stats, or any real-time decisions. It only affects elapsed-time readings
+//     if those are compared against wall time.
 // ============================================================================
+
+#define RTC1_TICKS_PER_SEC  993U    // 32768/33 = 992.97 Hz, rounded to nearest integer
 
 static void timing_init(void)
 {
@@ -113,21 +138,29 @@ static void timing_init(void)
     while (NRF_CLOCK->EVENTS_LFCLKSTARTED == 0);
     NRF_RTC1->PRESCALER = 32;   // 992.97 Hz (~1ms), 0.71% slow — see note above
     NRF_RTC1->TASKS_START = 1;
+    // Allow the counter to advance past 0 before get_timestamp_ms() is first
+    // called. Without this delay, a very fast loop iteration after timing_init()
+    // could read COUNTER=0, compute a next_tx_time of 4, and immediately
+    // trigger a timing resync when COUNTER has not yet advanced by 4 ticks.
     nrf_delay_ms(10);
 }
 
-// Returns uint16_t: wraps at 65535ms (~65.5s). Wrapping is handled
-// correctly by using uint16_t arithmetic in the timing loop.
+// Returns RTC ticks as uint16_t: wraps at 65535 ticks (~66.0s at 993Hz).
+// NOTE: These are RTC ticks, not true milliseconds. Each tick = ~1.007ms.
+// Wrapping is handled correctly by uint16_t subtraction in the timing loop.
+// The packet timestamp field carries these ticks directly.
 static inline uint16_t get_timestamp_ms(void)
 {
     return (uint16_t)(NRF_RTC1->COUNTER & 0xFFFF);
 }
 
-// Uptime in seconds. 24-bit counter overflows at ~4.7 hours;
-// this will produce one spurious status packet at that point.
+// Uptime in seconds. Divides by RTC1_TICKS_PER_SEC (993) for <0.003% error.
+// Previous implementation divided by 1000, which ran 0.71% fast.
+// 24-bit counter overflows at ~4.7 hours; this produces one spurious status
+// packet at that point — acceptable for a juggling performance context.
 static uint32_t get_uptime_seconds(void)
 {
-    return (uint32_t)(NRF_RTC1->COUNTER / 1000);
+    return (uint32_t)(NRF_RTC1->COUNTER / RTC1_TICKS_PER_SEC);
 }
 
 // ============================================================================
@@ -152,17 +185,29 @@ static void battery_init(void)
 
 static uint16_t read_battery_voltage(void)
 {
+    // Timeout guards added for consistency with fsr_read() — bare polling loops
+    // could hang indefinitely if the SAADC peripheral gets into a bad state.
+    // On timeout, return 0 (treated as USB-only by the caller).
     int16_t adc;
+    uint32_t timeout;
+
     NRF_SAADC->RESULT.PTR    = (uint32_t)&adc;
     NRF_SAADC->RESULT.MAXCNT = 1;
     NRF_SAADC->TASKS_START = 1;
-    while (NRF_SAADC->EVENTS_STARTED == 0);
+    timeout = 100000;
+    while (NRF_SAADC->EVENTS_STARTED == 0 && timeout > 0) { timeout--; }
+    if (timeout == 0) { NRF_SAADC->TASKS_STOP = 1; return 0; }
     NRF_SAADC->EVENTS_STARTED = 0;
+
     NRF_SAADC->TASKS_SAMPLE = 1;
-    while (NRF_SAADC->EVENTS_END == 0);
+    timeout = 100000;
+    while (NRF_SAADC->EVENTS_END == 0 && timeout > 0) { timeout--; }
+    if (timeout == 0) { NRF_SAADC->TASKS_STOP = 1; return 0; }
     NRF_SAADC->EVENTS_END = 0;
+
     NRF_SAADC->TASKS_STOP = 1;
-    while (NRF_SAADC->EVENTS_STOPPED == 0);
+    timeout = 100000;
+    while (NRF_SAADC->EVENTS_STOPPED == 0 && timeout > 0) { timeout--; }
     NRF_SAADC->EVENTS_STOPPED = 0;
 
     if (adc < 0) return 0;
@@ -214,6 +259,8 @@ static void transmit_status_packet(void)
     // SENSORS_TEMP_UNAVAILABLE (-32768) is below any physical temperature
     // and will not trigger emergency shutdown, but we store 0 in the packet
     // to avoid confusing the PC-side display with an impossible value.
+    // Decoders should check the sensor_health bitmask (SENSOR_BMP_OK) to
+    // determine whether a temperature of 0 means "0 degrees C" or "BMP absent".
     int16_t temp = sensors_read_temperature();
     s.temperature = (temp != SENSORS_TEMP_UNAVAILABLE) ? temp : 0;
 
@@ -498,7 +545,7 @@ int main(void)
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.4 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.5 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));
@@ -550,7 +597,7 @@ int main(void)
 
     // Timing initialisation
     next_tx_time = get_timestamp_ms() + TX_INTERVAL_MS;
-    static uint32_t last_status_uptime_sec = 0;
+    static uint32_t last_status_rtc_tick = 0;
 
     while (1)
     {
@@ -615,11 +662,14 @@ int main(void)
             recover_radio();
         }
 
-        // Status packet every STATUS_INTERVAL_SEC seconds
-        uint32_t uptime = get_uptime_seconds();
-        if ((uptime - last_status_uptime_sec) >= STATUS_INTERVAL_SEC) {
+        // Status packet every STATUS_INTERVAL_SEC seconds.
+        // Compare RTC ticks directly - avoids a 32-bit divide at 250Hz.
+        // Subtraction masked to 24 bits handles the RTC counter hardware
+        // wrap at 0xFFFFFF (~4.7 hours at 993Hz).
+        if (((NRF_RTC1->COUNTER - last_status_rtc_tick) & 0xFFFFFFU)
+                >= STATUS_INTERVAL_TICKS) {
             transmit_status_packet();
-            last_status_uptime_sec = uptime;
+            last_status_rtc_tick = NRF_RTC1->COUNTER;
         }
 
         loop_count++;
@@ -634,7 +684,7 @@ int main(void)
 
         // Precision timing
         // next_tx_time and current_time_ms are both uint16_t so subtraction
-        // wraps correctly at the 65535ms boundary.
+        // wraps correctly at the 65535-tick boundary (~66.0s at 993Hz).
         next_tx_time += TX_INTERVAL_MS;
         current_time_ms = get_timestamp_ms();
         int32_t time_diff = (int32_t)((int16_t)(next_tx_time - (uint16_t)current_time_ms));
