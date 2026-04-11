@@ -1,6 +1,6 @@
 # MIDI Juggling Balls — Project Reference
 
-**Version:** Post code-review session (TX v3.5, RX v1.5, Decoder v1.5, full pipeline validated clean)
+**Version:** Post exhaustive TX code review (TX v3.9, RX v1.5, Decoder v1.6, full pipeline validated clean)
 **Goal:** Wireless juggling ball → sensor data → sound reinforcing visual performance
 **Repo:** https://github.com/Minrat1995/MIDI-Juggling-Balls (private)
 **Target:** <20ms perceived latency, <1% packet loss, scalable to 3+ balls
@@ -10,22 +10,29 @@
 ## CURRENT STATUS
 
 ### What is done
-- TX firmware v3.5: all sensors validated on hardware, 250Hz confirmed stable, radio recovery cascade fixed
-- RX firmware v1.5: end-to-end radio validated, ~1-2% RF packet loss benchtop (see RF Loss Pattern below)
+- TX firmware v3.9: exhaustive two-round code review complete. All identified issues
+  resolved. Validated running on hardware (RTT confirmed, all sensors OK, pipeline clean).
+  Code considered production-ready pending RX equivalent review.
+  Key fixes across v3.7–v3.9: CRCPOLY/CRCINIT readback added to radio_init; sensors_test()
+  called at startup; get_timestamp_ms() renamed get_rtc_ticks(); HFCLK/LFCLK startup
+  timeouts (10ms/1000ms); saadc_stop_and_wait() helper for correct SAADC sequencing;
+  LSM6DSOX status bit symmetry; recover_radio() status reset; forward declaration for
+  indicate_error_fatal(); duplicate forward declaration removed.
+- RX firmware v1.5: end-to-end radio validated, ~1-2% RF packet loss benchtop. **Exhaustive
+  code review not yet performed — queue for next session (same process as TX).**
 - USB framing: confirmed working end-to-end. 0 resyncs, decoder queue drops = 0
-- C++ decoder: auto-detects COM14 via SERIALCOMM registry fallback, decodes to correct physical values
+- C++ decoder v1.6: auto-detects COM14 via SERIALCOMM registry fallback, decodes to correct physical values
 - Full data pipeline confirmed: TX → radio → RX → USB → decoder → console output
 - LIS3MDL confirmed running at 155Hz (FAST_ODR, CTRL_REG1=0xFE)
 - All sensors confirmed at startup: LSM6=0x6A LIS3=0x1C H3LIS=0x18 BMP=0x46 (CHIP_ID=0x50)
 - Decoder drain-loop fix confirmed: queue_drops=0 in steady state
-- Code review fixes applied in v3.5 (see BUGS FIXED): h3lis failure counter wrap,
-  temperature sign extension, H3LIS zero-on-failure, uptime divide accuracy,
-  sensor config named constants, fsr_read guard pattern
 
 ### Immediate next tasks
-1. Implement OSC output in decoder (stub already in place)
-2. Connect Pure Data patch, ASIO output
-3. Success criterion: move ball, hear sensor data drive audio in real time
+1. **Exhaustive code review of RX firmware (same process as TX — two full passes, senior
+   engineer scrutiny, produce clean files + deploy + git scripts)**
+2. Implement OSC output in decoder (stub already in place)
+3. Connect Pure Data patch, ASIO output
+4. Success criterion: move ball, hear sensor data drive audio in real time
 
 ### Known open issue — TX freeze after ~10-15 minutes
 Observed again this session: TX RTT goes silent, requires manual restart. The radio recovery
@@ -300,7 +307,7 @@ MIDI (discrete events, Phase 2):
 
 After flashing TX, connect J-Link and open RTT terminal. Expected startup:
 ```
-=== Juggling Ball TX (Ball 1) v3.5 ===
+=== Juggling Ball TX (Ball 1) v3.6 ===
 Packet sizes:
   radio_packet_t: 86 (expect 86)      <- must match
   sensor_data_t:  27 (expect 27)      <- must match
@@ -428,6 +435,18 @@ Acceptable benchtop results:
 | Sensor config register values inline magic bytes (TX) | sensors.c (TX) | Range/ODR changes require byte reconstruction; previous 0x68/0x64 confusion caused multi-session bug. Fix: named constants (LSM6_CTRL2_G_VAL etc.) |
 | get_uptime_seconds() divide by 1000 (TX) | main.c (TX) | RTC1 at 993Hz not 1000Hz; uptime read 0.71% fast (~12.8s/30min). Fix: divide by RTC1_TICKS_PER_SEC=993 |
 | timing_init() delay uncommented (TX) | main.c (TX) | 10ms delay purpose unclear; could be deleted by mistake. Fix: comment added explaining counter advance before first get_timestamp_ms() call |
+| BMP_ODR_CONFIG_VAL comment said PRESS_EN=1 (TX) | sensors.c (TX) | PRESS_EN is in OSR_CONFIG (0x36), not ODR_CONFIG (0x37). Wrong label on wrong register; dangerous given PRESS_EN debugging history. Fix: corrected comment |
+| init_bmp581() readback printed but not checked (TX) | sensors.c (TX) | Silent OSR_CONFIG write failure would leave PRESS_EN=0; init_bmp581() still returned true. Fix: compare readback, return false on mismatch — consistent with radio_init() discipline |
+| SENSOR_LSM6_OK not set on accel read success (TX) | sensors.c (TX) | Gyro success set the bit; accel success did not. Fragile to read-order changes. Fix: set SENSOR_LSM6_OK in both success paths |
+| Raw byte assembly (int16_t)(raw[0] \| (raw[1]<<8)) (TX) | sensors.c (TX) | Implementation-defined when raw[1]>=128 in C99/C11; same class of UB as extract_h3lis_axis. Fix: (int16_t)((uint16_t)raw[0] \| ((uint16_t)raw[1]<<8)) at all 12 sites (gyro/accel/mag/h3lis) |
+| sensors_test() never called (TX) | main.c (TX) | Dead public API — post-init WHO_AM_I re-check existed but was never invoked. Fix: called after sensors_init() succeeds; required sensor failure is fatal |
+| CRC_POLYNOMIAL comment "IBM CRC-24" wrong (packet_spec.h) | tx\, rx\, decoder\ packet_spec.h | 0x00065B is Nordic nRF proprietary CRC-24, not IBM CRC-24 (0x864CFB). Wrong label would cause independent CRC implementation to accept zero packets. Fix: corrected to "Nordic nRF proprietary radio CRC-24" |
+| timestamp comment "milliseconds, 65.5s" stale (packet_spec.h) | tx\, rx\, decoder\ packet_spec.h | RTC1 runs at 992.97Hz; field carries ticks not ms; wrap is ~66.0s not 65.5s. Fix: all three copies updated with ticks annotation and Phase 2 interpolation note |
+| stdbool.h / cstdbool unused includes (packet_spec.h) | tx\rx\ packet_spec.h, decoder\ packet_spec.h | bool not used in either version of the file. cstdbool deprecated in C++17 and removed in C++20. Fix: removed from both copies |
+| DecodedPacket::timestamp_ms field name (decoder) | main.cpp | Field named _ms, printed as "ms"; carries RTC ticks. Fix: renamed timestamp_ticks, printf updated |
+| Ctrl+C calls ExitProcess — no clean shutdown (decoder) | main.cpp | SerialReader destructor never ran; reader thread killed mid-operation; COM port not cleanly released. Fix: SetConsoleCtrlHandler sets g_running=false; main loop exits normally; destructor runs |
+| resync_events counter meaning undocumented (decoder) | main.cpp | Counter increments per byte advanced past, not per dropped packet. A single misalignment increments it many times; misleading in stats. Fix: label changed to resync_events with clarifying note in output |
+| RegQueryValueExA return value unchecked (decoder) | SerialReader.cpp | Failure silently left portName zero-initialised; device skipped without knowing why. Fix: check return value, continue on failure |
 
 ---
 
@@ -673,7 +692,31 @@ Decoder is inside the repo — files are not copied, they are edited in place.
 project_reference.md lives at docs\ inside the repo.
 Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
 
-- **TX rate is 250Hz (4ms).** Any reference to 125Hz/8ms is obsolete.
+- **TX firmware is v3.9.** Any reference to v3.6 or earlier is obsolete.
+- **indicate_error_fatal() requires a forward declaration** at the top of main.c.
+  It is called by timing_init() and the HFCLK startup block, both of which appear
+  before its definition. Without the forward declaration, C99/C11 constraint violation.
+- **LFCLK_STARTUP_TIMEOUT_MS = 1000ms.** The LFXO (32.768kHz crystal) takes 200-600ms
+  to start. A timeout of 10ms or less will always fire and halt the device. HFXO is
+  fast (<1ms); HFCLK_STARTUP_TIMEOUT_MS = 10ms is correct.
+- **LFCLK may already be running when timing_init() is called.** nrf_drv_twi_init()
+  (called inside sensors_init()) requests LFCLK via the driver. timing_init() checks
+  LFCLKSTAT.STATE and skips the start sequence if the clock is already running —
+  clearing EVENTS_LFCLKSTARTED and reissuing TASKS_LFCLKSTART on a running clock
+  causes the event to never re-fire and the timeout to trigger.
+- **git add requires files to be inside the repo working tree.** SDK path
+  (C:\nRF5_SDK_17.1.0\...) is outside the repo. Always copy SDK → repo tx\ first,
+  then git add tx\. See commit routine in FILE LOCATIONS AND COMMIT ROUTINE.
+- **get_timestamp_ms() is now get_rtc_ticks().** Any reference to get_timestamp_ms()
+  is obsolete. The rename was made to eliminate persistent confusion in changelogs.
+- **saadc_stop_and_wait() is a shared helper.** Both the normal and timeout-exit paths
+  of read_battery_voltage() use it. Do not replace it with inline TASKS_STOP without
+  also waiting for EVENTS_STOPPED — the nRF52840 SAADC requires the stop to complete
+  before TASKS_START can be issued again.
+- **RX exhaustive code review is pending.** Do not assume RX code quality matches TX.
+  Same two-pass senior review process applies before Phase 2 extended testing.
+- **TX v3.9 is the version to use.** main.c and sensors.c are in repo tx\ and SDK ses\.
+
 - **On-air packet size: 86 bytes. USB frame: 89 bytes (sync + payload + checksum).**
 - **USB framing constants are in packet_spec.h.** USB_SYNC_BYTE_0 (0xAA), USB_SYNC_BYTE_1 (0x55), USB_FRAME_SIZE (89). Do not redefine locally in usb_serial.c, main.c (RX), or SerialReader.cpp.
 - **packet_spec.h must be identical in tx\ and rx\.** Run fc to verify before committing.
@@ -695,7 +738,7 @@ Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
 - **Packet timestamp field carries RTC ticks, not true milliseconds.** RTC1 runs at 993Hz; each tick = ~1.007ms. For Phase 2 gap-fill interpolation, treat as ticks. Counter wraps at ~66.0s.
 - **get_uptime_seconds() divides by RTC1_TICKS_PER_SEC = 993**, not 1000. The old divide-by-1000 made uptime run 0.71% fast. If you see this constant changed back to 1000, revert it.
 - **runtime_sensor_status SENSOR_LSM6_OK clears on any single I2C read failure** during sensors_read(). A transient blip appears as "sensor failed" in the status packet. This is normal — correlate with i2c_errors count.
-- **H3LIS and LSM6 register init is not readback-verified** (unlike radio_init and BMP581). Plan to add before Phase 2 extended testing.
+- **H3LIS and LSM6 register init is not readback-verified** (unlike radio_init and BMP581, which now both validate readbacks). Plan to add before Phase 2 extended testing.
 - **OSC is primary protocol.** MIDI only for discrete events.
 - **USB init is non-fatal on RX.** RTT validation works without USB.
 - **TX does not need J-Link to transmit.** USB power is sufficient after flashing.
@@ -705,6 +748,10 @@ Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
 - **USB single-write is mandatory.** Three separate writes corrupt the stream on TX buffer busy.
 - **CDC ACM TX buffer must be 256 bytes.** Set in sdk_config.h, requires Clean+Build in SES.
 - **SerialReader queue drops (GetQueueDropCount) should be zero** during single-ball operation. Non-zero at Phase 3 multi-ball means consumer loop cannot keep up — review MAX_QUEUE_DEPTH and Sleep(1) budget.
+- **Decoder resync_events counts misaligned bytes, not dropped packets.** A single bad burst at startup can produce hundreds of resync_events with zero packet loss. Only worry if resyncs are non-zero in steady state.
+- **Decoder Ctrl+C exits cleanly** via g_running flag and console control handler. SerialReader destructor runs and joins the reader thread. If you replace the main loop structure, preserve this — without it the COM port may not release until the process is killed.
+- **DecodedPacket::timestamp_ticks** — field was previously named timestamp_ms. It carries RTC ticks, not milliseconds. Any OSC sender or logging code built on top must use ticks units for interpolation.
+- **CRC_POLYNOMIAL = 0x00065B is Nordic nRF proprietary CRC-24**, not IBM CRC-24 (0x864CFB). If implementing an independent CRC checker (e.g. Python analysis script), use 0x00065B with init 0x555555. Searching "IBM CRC-24" gives the wrong polynomial.
 - **SDK not in git.** nRF5 SDK v17.1.0, download separately from Nordic.
 - **SES .emProject not in git.** Contains absolute paths, machine-specific.
 - **VS2019 .sln and .vcxproj ARE in git.** These are safe to commit (no absolute paths).
