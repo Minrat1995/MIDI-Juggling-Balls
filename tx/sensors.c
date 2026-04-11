@@ -9,32 +9,26 @@
  *   - init_bmp581: status/reg_val initialised to 0 (was UB if I2C failed early)
  *   - BMP581 STATUS bit 0 nvm_rdy interpretation corrected (1=ready, not busy)
  *   - BMP581 OSR_CONFIG: 0x52 not 0x12 — bit 6 (PRESS_EN) must be set to
- *     enable pressure measurements. Without it the output registers stay at
- *     0x7F7F7F indefinitely regardless of other configuration. Confirmed in
- *     hardware testing: two units failed identically until this was corrected.
+ *     enable pressure measurements. Confirmed in hardware testing.
  *   - sensors_read_temperature: returns SENSORS_TEMP_UNAVAILABLE on failure
  *     instead of 0 (0 is a valid temperature and is ambiguous as an error)
  *   - fsr_init comment corrected: SAADC not yet enabled when fsr_init() runs
  *   - fsr_read: SAADC resolution save/restore scaffolded for Phase 3 wiring
- *   - Named constants added for all sensor register config values. Previously
- *     bare magic bytes made range/ODR changes error-prone (e.g. 0x68 vs 0x64
- *     for gyro range was a silent bug for multiple sessions).
+ *   - Named constants added for all sensor register config values.
  *   - h3lis_consecutive_failures: increment capped at H3LIS_FALLBACK_SUPPRESS_AFTER+1.
- *     uint8_t wraps at 255 (~1s at 250Hz); wrapping to 0 re-enabled fallback
- *     reads silently, defeating the suppression mechanism entirely.
  *   - sensors_read_temperature sign extension: changed (int32_t)0xFF000000 to
- *     ~(int32_t)0x00FFFFFF. The former is UB in C99/C11 (value exceeds INT_MAX);
- *     both produce the same result on two's complement hardware, but the latter
- *     is well-defined and does not generate -Wpedantic warnings.
- *   - H3LIS/pressure zero-on-failure: replaced memset(&h3lis_x_fsr_level, 0, 6)
- *     with explicit per-field assignment. The memset relied on the three H3LIS
- *     fields being contiguous and exactly 6 bytes at that struct offset; a future
- *     field insertion would silently zero the wrong memory without any assertion
- *     catching it.
- *   - fsr_read disabled code converted from C block comment to #if 0 / #endif.
- *     Block comments have no nesting and can be accidentally activated by partial
- *     edits; #if 0 makes the guard explicit and forces the developer to also
- *     remove the early return above.
+ *     ~(int32_t)0x00FFFFFF (well-defined in C99/C11).
+ *   - H3LIS/pressure zero-on-failure: explicit per-field assignment replaces
+ *     memset relying on struct field contiguity.
+ *   - fsr_read disabled code converted from block comment to #if 0 / #endif.
+ *   - BMP_OSR_CONFIG_VAL comment corrected (bit positions and OSR_T value).
+ *   - BMP_ODR_CONFIG_VAL comment: removed incorrect PRESS_EN attribution.
+ *   - h3lis_z_flags: removed redundant | 0; added comment for reserved nibble.
+ *   - i2c_read_regs: added note about double-count i2c_error_count behaviour.
+ *   - sensors_read() LSM6DSOX: both gyro and accel now independently contribute
+ *     to SENSOR_LSM6_OK using a local flag. Previously gyro success set the bit
+ *     but accel success did not — achieving correct semantics only coincidentally.
+ *     The explicit pattern makes the intent clear and removes the maintenance trap.
  */
 
 #include "sensors.h"
@@ -88,9 +82,8 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 #define LSM6DSOX_ID     0x6C
 
 // LSM6DSOX configuration register values
-// These are named to make future range/ODR changes explicit and grep-able.
-// Changing the gyro range (e.g. 500→1000dps) requires updating both the
-// register value AND the packet_spec.h scaling comment.
+// Changing the gyro range requires updating both the register value AND the
+// packet_spec.h scaling comment.
 #define LSM6_CTRL1_XL_VAL   0x66    // ODR[7:4]=0110=416Hz, FS_XL[3:2]=11=+/-16g
 #define LSM6_CTRL2_G_VAL    0x64    // ODR[7:4]=0110=416Hz, FS_G[3:2]=01=+/-500dps
                                     // NOTE: 0x68 = +/-1000dps — do NOT use (was a bug)
@@ -109,9 +102,9 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 #define LIS3MDL_ID      0x3D
 
 // LIS3MDL configuration register values
-#define LIS3_CTRL_REG1_VAL  0xFE    // TEMP_EN=1, OM=11(UHP), DO=111, FAST_ODR=1 → 155Hz
+#define LIS3_CTRL_REG1_VAL  0xFE    // TEMP_EN=1, OM=11(UHP), DO=111, FAST_ODR=1 -> 155Hz
                                     // NOTE: 0xFC = 80Hz (FAST_ODR=0) — do NOT use (was a bug)
-#define LIS3_CTRL_REG2_VAL  0x00    // FS=00 → +/-4 gauss
+#define LIS3_CTRL_REG2_VAL  0x00    // FS=00 -> +/-4 gauss
 #define LIS3_CTRL_REG3_VAL  0x00    // continuous conversion mode
 #define LIS3_CTRL_REG4_VAL  0x0C    // OMZ=11(UHP), BLE=0(LE)
 
@@ -143,14 +136,27 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 
 #define BMP_CMD_SOFT_RESET  0xB6
 #define BMP581_ID           0x50
+// BMP581_ID_ALT: observed on some hardware revisions / Adafruit breakout batches.
+// Not documented in the public datasheet; included from empirical testing.
+// Both IDs produce identical register behaviour.
 #define BMP581_ID_ALT       0x51
 
 // BMP581 configuration register values
 // PRESS_EN (bit 6 of OSR_CONFIG) MUST be 1. 0x12 (PRESS_EN=0) was the original
-// value and caused 0x7F7F7F output on all units until corrected. Verified on hardware.
-#define BMP_OSR_CONFIG_VAL  0x52    // PRESS_EN(bit6)=1, OSR_T[4:2]=001(x2), OSR_P[1:0]=10(x4)
-                                    // NOTE: 0x12 = PRESS_EN=0 — do NOT use (was a bug)
-#define BMP_ODR_CONFIG_VAL  0x11    // PRESS_EN=1, MODE[1:0]=01=NORMAL, ODR=0=~218Hz
+// value and caused 0x7F7F7F output on all units until corrected.
+//
+// 0x52 = 0b01010010:
+//   bit[6]   = 1      PRESS_EN — enables pressure measurement (MUST be 1)
+//   bits[5:3]= 010    OSR_P — pressure oversampling x4
+//   bits[2:0]= 010    OSR_T — temperature oversampling x4
+//
+// NOTE: 0x12 = PRESS_EN=0 — do NOT use (was a bug; pressure output stays at
+// 0x7F7F7F regardless of all other configuration).
+#define BMP_OSR_CONFIG_VAL  0x52
+
+// 0x11 = MODE=NORMAL (bits[1:0]=01), ODR=maximum (~218Hz at these OSR settings)
+// PRESS_EN is in OSR_CONFIG (0x36), NOT this register.
+#define BMP_ODR_CONFIG_VAL  0x11
 
 // ============================================================================
 // GLOBAL STATE
@@ -167,17 +173,17 @@ static uint8_t bmp_addr   = 0;
 // Initialised to 0x00: do not report sensors OK before detection runs
 static uint8_t  runtime_sensor_status = 0x00;
 static uint16_t i2c_error_count = 0;
+// fsr_initialized: set true by fsr_init(), but only READ inside the #if 0 block
+// in fsr_read(). Currently a write-only variable in the Phase 2 build. It gates
+// the SAADC sequence in Phase 3 to guard against fsr_read() being called before
+// fsr_init() runs. Do not remove it before enabling the Phase 3 block.
 static bool     fsr_initialized  = false;
 
 // H3LIS331 burst-read failure suppression.
 // After H3LIS_FALLBACK_SUPPRESS_AFTER consecutive burst failures the single-byte
 // fallback path is skipped and zeros are written instead. This bounds worst-case
-// sensors_read() time: a suppressed read costs one failed transaction (~100us)
-// rather than six (~1.5ms). The counter resets on any successful burst read.
-//
-// The counter is capped at H3LIS_FALLBACK_SUPPRESS_AFTER + 1 on increment.
-// Without the cap, uint8_t wraps at 255 (~1 second at 250Hz), resetting the
-// suppression and re-enabling fallback reads silently.
+// sensors_read() time. The counter resets on any successful burst read.
+// Capped at SUPPRESS_AFTER+1 to prevent uint8_t wrap-at-255 re-enabling fallback.
 #define H3LIS_FALLBACK_SUPPRESS_AFTER  3
 static uint8_t h3lis_consecutive_failures = 0;
 
@@ -198,6 +204,10 @@ static bool i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t value)
 
 static bool i2c_read_regs(uint8_t addr, uint8_t reg, uint8_t *data, uint8_t len)
 {
+    // Note: i2c_error_count may increment twice per call — once if the TX
+    // (address write) phase fails, once if the RX (data read) phase fails.
+    // The count is diagnostic-only: it is a per-failure-leg count, not a
+    // strict per-transaction count.
     ret_code_t err;
     err = nrf_drv_twi_tx(&m_twi, addr, &reg, 1, true);
     if (err != NRF_SUCCESS) { i2c_error_count++; return false; }
@@ -248,9 +258,9 @@ static bool fsr_read(uint16_t *fsr_out)
 
 #if 0  /* Phase 3: remove the early return above and this #if 0 / #endif.
           BEFORE ENABLING: verify the resolution save/restore is present —
-          battery_init() sets 12-bit; FSR calibration constants (FSR_CONTACT_THRESHOLD=80
-          and >>6 intensity scaling) are calibrated for 10-bit (0-1023). Without
-          save/restore the threshold becomes 4x too sensitive.
+          battery_init() sets 12-bit; FSR calibration constants
+          (FSR_CONTACT_THRESHOLD=80 and >>6 intensity scaling) are calibrated
+          for 10-bit (0-1023). Without save/restore the threshold is 4x too sensitive.
 
           Wiring targets:
             FSR0 -> P0.03 (SAADC Ch1)
@@ -354,6 +364,8 @@ static uint8_t detect_bmp581(void)
                 BMP581_ADDR_1, chip_id);
             return BMP581_ADDR_1;
         }
+        SEGGER_RTT_printf(0, "Device at 0x%02X: CHIP_ID=0x%02X (expected 0x%02X or 0x%02X)\r\n",
+            BMP581_ADDR_1, chip_id, BMP581_ID, BMP581_ID_ALT);
     }
     if (i2c_read_reg(BMP581_ADDR_2, BMP_CHIP_ID, &chip_id)) {
         if (chip_id == BMP581_ID || chip_id == BMP581_ID_ALT) {
@@ -361,6 +373,8 @@ static uint8_t detect_bmp581(void)
                 BMP581_ADDR_2, chip_id);
             return BMP581_ADDR_2;
         }
+        SEGGER_RTT_printf(0, "Device at 0x%02X: CHIP_ID=0x%02X (expected 0x%02X or 0x%02X)\r\n",
+            BMP581_ADDR_2, chip_id, BMP581_ID, BMP581_ID_ALT);
     }
     return 0;
 }
@@ -371,7 +385,6 @@ static uint8_t detect_bmp581(void)
 
 static bool init_bmp581(void)
 {
-    // Initialise to 0: safe to print even if I2C reads fail before assignment
     uint8_t status  = 0;
     uint8_t reg_val = 0;
 
@@ -401,9 +414,8 @@ static bool init_bmp581(void)
 
     // nvm_rdy (bit 0): 1 = NVM subsystem ready (datasheet confirmed)
     // nvm_err (bit 1): 1 = NVM error (calibration load failed)
-    // NOTE: nvm_err has been observed on genuine working Adafruit BMP581
-    // breakouts during hardware testing. It does not prevent correct operation
-    // provided pressure reads return valid data. Do not treat it as fatal.
+    // NOTE: nvm_err observed on genuine working Adafruit BMP581 breakouts.
+    // Does not prevent correct operation if pressure reads return valid data.
     SEGGER_RTT_printf(0, "Step 3: STATUS analysis:\r\n");
     SEGGER_RTT_printf(0, "  nvm_rdy=%s nvm_err=%s drdy=%s\r\n",
         (status & 0x01) ? "ready" : "NOT READY",
@@ -413,12 +425,7 @@ static bool init_bmp581(void)
         SEGGER_RTT_printf(0, "  WARNING: NVM error flag set (observed on known-good units)\r\n");
     }
 
-    // BMP_OSR_CONFIG_VAL = 0x52:
-    //   bit 6 (PRESS_EN) = 1  — MUST be set to enable pressure measurement.
-    //                           Without this bit, output registers stay at
-    //                           0x7F7F7F regardless of all other config.
-    //   bits [4:2] (OSR_T)    = 001 = temperature oversampling x2
-    //   bits [1:0] (OSR_P)    = 10  = pressure oversampling x4
+    // BMP_OSR_CONFIG_VAL = 0x52: PRESS_EN=1, OSR_P=x4, OSR_T=x4
     SEGGER_RTT_printf(0, "Step 4: OSR config (PRESS_EN=1, pres x4, temp x4)...\r\n");
     if (!i2c_write_reg(bmp_addr, BMP_OSR_CONFIG, BMP_OSR_CONFIG_VAL)) {
         SEGGER_RTT_printf(0, "  FAILED\r\n"); return false;
@@ -486,7 +493,7 @@ bool sensors_init(void)
         .sda                = I2C_SDA_PIN,
         .frequency          = NRF_DRV_TWI_FREQ_400K,
         .interrupt_priority = APP_IRQ_PRIORITY_HIGH,
-        .clear_bus_init     = true     // Clock bus free if SDA stuck low after abnormal reset
+        .clear_bus_init     = true
     };
 
     ret_code_t err = nrf_drv_twi_init(&m_twi, &twi_config, NULL, NULL);
@@ -532,20 +539,23 @@ bool sensors_init(void)
     }
 
     // ---- LSM6DSOX configuration ----
+    //
+    // Note: SENSOR_LSM6_OK and SENSOR_LIS3_OK are set above (after detection)
+    // and NOT cleared if the config writes below fail. This is intentional:
+    // LSM6 and LIS3 are required sensors; a config failure causes sensors_init()
+    // to return false and the device to halt in indicate_error_fatal(). Cleanup
+    // of runtime_sensor_status is unnecessary because the state is never observed.
+    // This is asymmetric with H3LIS/BMP, which clear their bits and continue
+    // because those sensors are optional.
 
-    // CTRL1_XL: 416Hz ODR, +/-16g (LSM6_CTRL1_XL_VAL = 0x66)
     if (!i2c_write_reg(lsm6_addr, LSM6_CTRL1_XL, LSM6_CTRL1_XL_VAL)) {
         SEGGER_RTT_printf(0, "ERROR: LSM6DSOX CTRL1_XL failed\r\n");
         return false;
     }
-
-    // CTRL2_G: 416Hz ODR, +/-500dps (LSM6_CTRL2_G_VAL = 0x64, NOT 0x68 = +/-1000dps)
     if (!i2c_write_reg(lsm6_addr, LSM6_CTRL2_G, LSM6_CTRL2_G_VAL)) {
         SEGGER_RTT_printf(0, "ERROR: LSM6DSOX CTRL2_G failed\r\n");
         return false;
     }
-
-    // CTRL3_C: BDU=1, IF_INC=1 (LSM6_CTRL3_C_VAL = 0x44)
     if (!i2c_write_reg(lsm6_addr, LSM6_CTRL3_C, LSM6_CTRL3_C_VAL)) {
         SEGGER_RTT_printf(0, "ERROR: LSM6DSOX CTRL3_C failed\r\n");
         return false;
@@ -554,23 +564,18 @@ bool sensors_init(void)
 
     // ---- LIS3MDL configuration ----
 
-    // CTRL_REG1: ultra-high perf XY, 155Hz (FAST_ODR enabled), temp enabled
-    // LIS3_CTRL_REG1_VAL = 0xFE. NOT 0xFC (80Hz, FAST_ODR=0).
     if (!i2c_write_reg(lis3_addr, LIS3_CTRL_REG1, LIS3_CTRL_REG1_VAL)) {
         SEGGER_RTT_printf(0, "ERROR: LIS3MDL CTRL_REG1 failed\r\n");
         return false;
     }
-    // CTRL_REG2: +/-4 gauss
     if (!i2c_write_reg(lis3_addr, LIS3_CTRL_REG2, LIS3_CTRL_REG2_VAL)) {
         SEGGER_RTT_printf(0, "ERROR: LIS3MDL CTRL_REG2 failed\r\n");
         return false;
     }
-    // CTRL_REG3: continuous conversion
     if (!i2c_write_reg(lis3_addr, LIS3_CTRL_REG3, LIS3_CTRL_REG3_VAL)) {
         SEGGER_RTT_printf(0, "ERROR: LIS3MDL CTRL_REG3 failed\r\n");
         return false;
     }
-    // CTRL_REG4: ultra-high perf Z, little-endian
     if (!i2c_write_reg(lis3_addr, LIS3_CTRL_REG4, LIS3_CTRL_REG4_VAL)) {
         SEGGER_RTT_printf(0, "ERROR: LIS3MDL CTRL_REG4 failed\r\n");
         return false;
@@ -580,7 +585,6 @@ bool sensors_init(void)
     // ---- H3LIS331 configuration (optional) ----
 
     if (h3lis_addr != 0) {
-        // CTRL_REG1: normal mode, 400Hz, all axes (H3LIS_CTRL_REG1_VAL = 0x37)
         if (!i2c_write_reg(h3lis_addr, H3LIS_CTRL_REG1, H3LIS_CTRL_REG1_VAL)) {
             SEGGER_RTT_printf(0, "WARNING: H3LIS331 CTRL_REG1 failed\r\n");
             h3lis_addr = 0;
@@ -588,7 +592,6 @@ bool sensors_init(void)
         }
     }
     if (h3lis_addr != 0) {
-        // CTRL_REG4: BDU=1, +/-400g, little-endian (H3LIS_CTRL_REG4_VAL = 0xB0)
         if (!i2c_write_reg(h3lis_addr, H3LIS_CTRL_REG4, H3LIS_CTRL_REG4_VAL)) {
             SEGGER_RTT_printf(0, "WARNING: H3LIS331 CTRL_REG4 failed\r\n");
             h3lis_addr = 0;
@@ -635,26 +638,34 @@ void sensors_read(sensor_data_t *data)
         return;
     }
 
-    // LSM6DSOX gyro (auto-increment, no special flag needed on LSM6DSOX)
+    // LSM6DSOX gyro and accel.
+    // SENSOR_LSM6_OK is set only if BOTH reads succeed, and cleared if either
+    // fails. A local flag accumulates both results before writing the status bit,
+    // making the AND-semantics explicit rather than relying on the ordering of
+    // set/clear operations across two separate branches.
+    bool lsm6_ok = true;
+
     if (i2c_read_regs(lsm6_addr, LSM6_OUTX_L_G, raw, 6)) {
         data->imu.gyro[0] = (int16_t)(raw[0] | (raw[1] << 8));
         data->imu.gyro[1] = (int16_t)(raw[2] | (raw[3] << 8));
         data->imu.gyro[2] = (int16_t)(raw[4] | (raw[5] << 8));
-        runtime_sensor_status |= SENSOR_LSM6_OK;
     } else {
         memset(data->imu.gyro, 0, sizeof(data->imu.gyro));
-        runtime_sensor_status &= ~SENSOR_LSM6_OK;
+        lsm6_ok = false;
     }
 
-    // LSM6DSOX accel
+    // LSM6DSOX accel (auto-increment, no special flag needed on LSM6DSOX)
     if (i2c_read_regs(lsm6_addr, LSM6_OUTX_L_A, raw, 6)) {
         data->imu.accel[0] = (int16_t)(raw[0] | (raw[1] << 8));
         data->imu.accel[1] = (int16_t)(raw[2] | (raw[3] << 8));
         data->imu.accel[2] = (int16_t)(raw[4] | (raw[5] << 8));
     } else {
         memset(data->imu.accel, 0, sizeof(data->imu.accel));
-        runtime_sensor_status &= ~SENSOR_LSM6_OK;
+        lsm6_ok = false;
     }
+
+    if (lsm6_ok) runtime_sensor_status |=  SENSOR_LSM6_OK;
+    else         runtime_sensor_status &= ~SENSOR_LSM6_OK;
 
     // LIS3MDL magnetometer
     // IMPORTANT: | 0x80 sets the MSB of the sub-address, enabling register
@@ -681,10 +692,8 @@ void sensors_read(sensor_data_t *data)
 
         if (!h3lis_ok) {
             if (h3lis_consecutive_failures < H3LIS_FALLBACK_SUPPRESS_AFTER) {
-                // Fallback: single-byte reads (slower, avoids bus issues).
-                // Suppressed after H3LIS_FALLBACK_SUPPRESS_AFTER consecutive
-                // failures to bound worst-case loop time. Zeros are written
-                // instead, which the decoder can distinguish from real data.
+                // Fallback: single-byte reads. Suppressed after SUPPRESS_AFTER
+                // consecutive failures to bound worst-case loop time.
                 h3lis_ok = true;
                 for (int axis = 0; axis < 3; axis++) {
                     uint8_t lo, hi;
@@ -699,9 +708,6 @@ void sensors_read(sensor_data_t *data)
                 }
             }
             if (!h3lis_ok) {
-                // Cap at SUPPRESS_AFTER+1 to prevent uint8_t wrap-at-255.
-                // Wrapping to 0 would re-enable fallback reads after ~1 second
-                // of sustained failure, defeating the suppression mechanism.
                 if (h3lis_consecutive_failures < H3LIS_FALLBACK_SUPPRESS_AFTER + 1)
                     h3lis_consecutive_failures++;
             }
@@ -713,7 +719,12 @@ void sensors_read(sensor_data_t *data)
             h3lis_raw[1] = (int16_t)(raw[2] | (raw[3] << 8));
             h3lis_raw[2] = (int16_t)(raw[4] | (raw[5] << 8));
 
-            fsr_read(fsr_raw);
+            // fsr_read() always returns false and writes zeros until Phase 3.
+            // Return value discarded: a false return with zero fsr_raw is
+            // indistinguishable from "no contact" at the decoder, which is the
+            // correct representation of an unwired FSR. The SENSOR_FSRx_OK bits
+            // in sensor_health provide the authoritative "wired or not" signal.
+            (void)fsr_read(fsr_raw);
 
             uint16_t max_fsr = 0;
             for (int i = 0; i < 4; i++) {
@@ -731,13 +742,10 @@ void sensors_read(sensor_data_t *data)
             // zeros in bits [3:0]. The mask makes the packing intention explicit.
             data->h3lis_x_fsr_level   = (h3lis_raw[0] & (int16_t)0xFFF0) | (int16_t)fsr_intensity;
             data->h3lis_y_fsr_pattern = (h3lis_raw[1] & (int16_t)0xFFF0) | (int16_t)fsr_pattern;
-            data->h3lis_z_flags       = (h3lis_raw[2] & (int16_t)0xFFF0) | 0;
+            // Lower 4 bits of z-axis field are reserved; mask clears them.
+            data->h3lis_z_flags       = h3lis_raw[2] & (int16_t)0xFFF0;
             runtime_sensor_status |= SENSOR_H3LIS_OK;
         } else {
-            // Zero fields individually, not via memset(&h3lis_x_fsr_level, 0, 6).
-            // The memset form relies on the three fields being contiguous and
-            // exactly 6 bytes at that offset; a future struct change could silently
-            // zero the wrong memory. Explicit assignment is layout-independent.
             data->h3lis_x_fsr_level   = 0;
             data->h3lis_y_fsr_pattern = 0;
             data->h3lis_z_flags       = 0;
@@ -749,7 +757,7 @@ void sensors_read(sensor_data_t *data)
         data->h3lis_z_flags       = 0;
     }
 
-    // BMP581 pressure (raw is in 1/64 Pa units; Pa = raw/64)
+    // BMP581 pressure (raw in 1/64 Pa; Pa = raw/64)
     if (bmp_addr != 0) {
         uint8_t press[3];
         if (i2c_read_regs(bmp_addr, BMP_PRESS_XLSB, press, 3)) {
@@ -768,6 +776,11 @@ void sensors_read(sensor_data_t *data)
 
 bool sensors_test(void)
 {
+    // Returns true if all REQUIRED sensors (LSM6DSOX, LIS3MDL) pass WHO_AM_I
+    // re-read AND all DETECTED optional sensors (H3LIS331, BMP581) also pass.
+    // An optional sensor that was not detected at init time (addr == 0) is
+    // excluded — absence is not a failure. An optional sensor that WAS detected
+    // but now fails the re-read IS counted as a failure.
     uint8_t id;
     bool ok = true;
     if (!twi_initialized) return false;
@@ -783,13 +796,17 @@ bool sensors_test(void)
         ok = false;
     }
     if (h3lis_addr != 0) {
-        if (!i2c_read_reg(h3lis_addr, H3LIS_WHO_AM_I, &id) || id != H3LIS331_ID)
+        if (!i2c_read_reg(h3lis_addr, H3LIS_WHO_AM_I, &id) || id != H3LIS331_ID) {
             SEGGER_RTT_printf(0, "H3LIS331 test FAILED\r\n");
+            ok = false;
+        }
     }
     if (bmp_addr != 0) {
         if (!i2c_read_reg(bmp_addr, BMP_CHIP_ID, &id) ||
-            (id != BMP581_ID && id != BMP581_ID_ALT))
+            (id != BMP581_ID && id != BMP581_ID_ALT)) {
             SEGGER_RTT_printf(0, "BMP581 test FAILED\r\n");
+            ok = false;
+        }
     }
     return ok;
 }
@@ -799,9 +816,6 @@ uint16_t sensors_get_i2c_error_count(void)  { return i2c_error_count; }
 
 int16_t sensors_read_temperature(void)
 {
-    // Return sentinel if BMP581 is absent or read fails.
-    // SENSORS_TEMP_UNAVAILABLE (-32768) = -327.68 C, physically impossible.
-    // Callers must check for this value before using the result.
     if (bmp_addr == 0) return SENSORS_TEMP_UNAVAILABLE;
 
     uint8_t t[3];
@@ -811,10 +825,8 @@ int16_t sensors_read_temperature(void)
     int32_t raw = (int32_t)(t[0] | (t[1] << 8) | (t[2] << 16));
 
     // Sign-extend from bit 23 to 32 bits.
-    // ~(int32_t)0x00FFFFFF is used rather than (int32_t)0xFF000000 because
-    // 0xFF000000 exceeds INT_MAX and casting it to int32_t is implementation-
-    // defined in C99/C11. ~0x00FFFFFF produces the identical bit pattern on
-    // two's complement hardware and is well-defined.
+    // ~(int32_t)0x00FFFFFF is well-defined; (int32_t)0xFF000000 is not (exceeds
+    // INT_MAX in C99/C11). Both produce the same bit pattern on two's complement.
     if (raw & 0x800000) raw |= ~(int32_t)0x00FFFFFF;
 
     // BMP581: 1/65536 C per LSB -> 0.01 C units

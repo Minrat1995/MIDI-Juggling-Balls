@@ -13,37 +13,84 @@
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
  *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
  *
- * @version 3.5
+ * @version 3.9
+ *
+ * Changelog from 3.8:
+ *   - CLOCK_STARTUP_TIMEOUT_MS comment corrected: said "10000 iterations at 1ms
+ *     each" — the loop decrements from 10 with nrf_delay_ms(1) per iteration,
+ *     giving 10 iterations × 1ms = 10ms total. The value was always correct;
+ *     only the comment was wrong.
+ *   - current_time_ms renamed to current_ticks throughout main(). The variable
+ *     holds the return value of get_rtc_ticks() (uint16_t); keeping the _ms
+ *     suffix after the v3.7 function rename was an incomplete refactor.
+ *   - indicate_error_fatal() forward declaration added. The function is called by
+ *     timing_init() (defined early in the file) but was defined later, with no
+ *     prior declaration. C99/C11 constraint violation; GCC warns and compiles but
+ *     the forward declaration makes the dependency explicit.
+ *   - BATTERY_SHUTDOWN_MV / BATTERY_EMPTY_MV: comment added documenting the
+ *     deliberate identity (both 3300mV). The shutdown test is strict-less-than so
+ *     exactly 3300mV does not shut down; estimate_battery_percent returns 0 at
+ *     <=3300mV. Future editors must not adjust one constant independently of the
+ *     other without understanding this boundary.
+ *   - sensors_init() LSM6/LIS3 status bits: comment added explaining why config
+ *     failure returns false without clearing the status bits — the device halts on
+ *     any required sensor failure, so cleanup is unnecessary. This explains the
+ *     intentional asymmetry with H3LIS/BMP handling.
+ *
+ * Changelog from 3.7:
+ *   - recover_radio(): radio_status set to RADIO_STATE_OK on successful recovery.
+ *     Previously left holding the failure code until the next transmit_packet()
+ *     call corrected it — causing stale diagnostic state in any debug session
+ *     that reads radio_status immediately after recovery.
+ *   - prepare_packet(): comment added noting the ~1ms timestamp lag. The timestamp
+ *     is taken after sensor reads complete; at 4ms TX interval this is ~25% stale
+ *     relative to actual sample time. Phase 2 gap-fill should use sequence number,
+ *     not the timestamp field, for interpolation position.
+ *   - calculate_checksum(): comment added documenting the field-order dependency.
+ *     The loop covers sizeof-1 bytes, implicitly requiring checksum to be the last
+ *     field. The _Static_assert guards size, not order; a field inserted after
+ *     checksum without updating the loop would silently cover the wrong bytes.
+ *
+ * Changelog from 3.6:
+ *   - radio_init(): CRCPOLY and CRCINIT added to readback verification. These were
+ *     previously unchecked. A wrong CRC polynomial produces a complete silent dead
+ *     link: TX transmits, RX drops every packet on CRC failure, no error counted.
+ *   - sensors_test() added at startup. The function performs WHO_AM_I re-reads after
+ *     init, catching a sensor that passes detection but fails to hold communication.
+ *     Result is logged but non-fatal (sensors_init() already verified core sensors).
+ *   - get_timestamp_ms() renamed to get_rtc_ticks(). The _ms suffix was a persistent
+ *     source of confusion: four changelog entries existed solely to re-clarify that
+ *     the function returns RTC ticks, not milliseconds. Renaming eliminates all
+ *     compensating comments.
+ *   - last_status_rtc_tick moved from static local inside main() to file scope.
+ *     Static locals inside non-recursive functions are valid C but hide persistent
+ *     state from the global state block and cannot be referenced externally.
+ *   - Clock startup (HFCLK and LFCLK) now has explicit timeout guards, consistent
+ *     with all other peripheral waits. Both previously spun without limit; a crystal
+ *     failure at power-on would hang silently with no LED indication.
+ *   - calculate_checksum() signature: status_packet_t* -> const status_packet_t*.
+ *     The function only reads; the non-const signature was inaccurate.
+ *   - read_battery_voltage() early timeout returns: TASKS_STOP now waits for
+ *     EVENTS_STOPPED before returning. Previously, TASKS_STOP was issued and the
+ *     function returned immediately, leaving the SAADC in an indeterminate stop
+ *     state for the next call. This correctly handles the exceptional case (which
+ *     is exactly the case these timeout guards exist to handle).
+ *
+ * Changelog from 3.5:
+ *   - current_time_ms: uint32_t -> uint16_t.
+ *   - RADIO_READY_TIMEOUT_US added (1000).
+ *   - Debug timing print: removed redundant loop_count==0 clause.
+ *   - Version banner updated to v3.6.
  *
  * Changelog from 3.4:
- *   - RTC1_TICKS_PER_SEC constant added (993). get_uptime_seconds() was dividing
- *     COUNTER by 1000; RTC1 runs at 32768/33 = 992.97 Hz so uptime read 0.71%
- *     fast (12.8s ahead after 30 minutes). Dividing by 993 reduces error to
- *     <0.003%.
- *   - get_timestamp_ms() comment clarified: the function returns RTC ticks, not
- *     true milliseconds. Each tick is ~1.007ms (993Hz). The 0.71% slow rate
- *     means the counter wraps at ~66.0s, not 65.5s. For Phase 2 t1/t2 gap-fill
- *     interpolation, treat the packet timestamp field as ticks, not ms.
+ *   - RTC1_TICKS_PER_SEC constant added (993).
  *   - timing_init() nrf_delay_ms(10) comment added.
  *
  * Changelog from 3.3:
- *   - radio_init(): power cycle delay increased 10us -> 1ms. 10us was empirically
- *     too short for the radio peripheral power domain to stabilise after POWER=0/1.
- *     If the peripheral is not fully powered when radio_init() reads STATE, the
- *     readback is wrong and init returns false unconditionally.
- *   - transmit_packet(): __DMB() added before TASKS_TXEN. The Cortex-M4 write
- *     buffer can hold pending stores to tx_packet in SRAM. Without a barrier the
- *     DMA transfer can begin before all stores are visible to the bus fabric,
- *     resulting in stale or partially-updated packet data being transmitted.
- *   - recover_radio(): now polls EVENTS_DISABLED rather than sleeping a fixed 1ms.
- *     On a timeout or mid-TX failure the DISABLED event may arrive up to several
- *     hundred us after TASKS_DISABLE; sleeping 1ms was a guess and not reliable.
- *   - recover_radio(): removed indicate_error_radio() call. That function blocked
- *     for 3 seconds per call and returned to the main loop. A failed recover_radio()
- *     caused the loop to call transmit_packet() immediately, fail again, call
- *     recover_radio() again, block 3 more seconds, and so on. The main loop's
- *     1Hz LED heartbeat (toggled every 250 packets) provides sufficient liveness
- *     indication; a frozen heartbeat means the radio is stuck.
+ *   - radio_init(): power cycle delay increased 10us -> 1ms.
+ *   - transmit_packet(): __DMB() added before TASKS_TXEN.
+ *   - recover_radio(): polls EVENTS_DISABLED rather than sleeping 1ms.
+ *   - recover_radio(): removed indicate_error_radio() call.
  */
 
 #include <stdint.h>
@@ -58,6 +105,11 @@
 
 extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 
+// Forward declaration: indicate_error_fatal() is defined in the ERROR INDICATION
+// section below, but is called earlier by timing_init() (LFCLK timeout) and by
+// the HFCLK startup block in main(). C requires a declaration before first use.
+static void indicate_error_fatal(void);
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -71,19 +123,37 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 #define STATUS_INTERVAL_SEC     120         // Status packet every 2 minutes
 // RTC1 runs at 32768/(PRESCALER+1) = 32768/33 = 992.97 Hz.
 // STATUS_INTERVAL_TICKS avoids a 32-bit divide in the hot loop.
-// Slight inaccuracy (~0.71%) matches the existing clock note above.
 #define STATUS_INTERVAL_TICKS   ((STATUS_INTERVAL_SEC * 32768U) / 33U)  // ~119156
 
 #define BATTERY_SHUTDOWN_MV     3300
 #define TEMP_EMERGENCY_SHUTDOWN 6000        // 60.00 C in 0.01 C units
 #define BATTERY_USB_THRESHOLD   1000        // Below 1V = USB-only, no battery
 #define BATTERY_FULL_MV         4200
+// BATTERY_EMPTY_MV and BATTERY_SHUTDOWN_MV are intentionally the same value.
+// The shutdown test in transmit_status_packet() is strict less-than (<3300mV),
+// so exactly 3300mV does not trigger shutdown. estimate_battery_percent()
+// returns 0 for <=3300mV. Do not adjust one constant independently of the
+// other — changing either moves the zero-percent / shutdown boundary.
 #define BATTERY_EMPTY_MV        3300
 
 // RF constants and packet structures are in packet_spec.h (via sensors.h)
 
-#define RADIO_TIMEOUT_US        5000        // 5ms per operation
+// Separate timeouts for READY and END/DISABLED:
+//   RADIO_READY_TIMEOUT_US  — radio ramp-up from DISABLED is fast; 1ms is
+//     conservative and avoids waiting for a peripheral that may not respond.
+//   RADIO_TIMEOUT_US        — used for END (TX completion) and DISABLED.
+//     5ms accounts for a full 86-byte packet + disable sequence at 2Mbps.
+#define RADIO_READY_TIMEOUT_US  1000        // 1ms: ramp-up from DISABLED
+#define RADIO_TIMEOUT_US        5000        // 5ms: TX completion and DISABLE
 #define TX_POWER                RADIO_TXPOWER_TXPOWER_Pos8dBm
+
+// Clock startup timeouts.
+// HFXO (16MHz crystal) starts in <1ms; 10ms is conservative.
+// LFXO (32.768kHz crystal) startup time on nRF52840 is typically 200-600ms;
+// 1000ms provides a safe margin. The original bare-spin had no timeout at all —
+// 1000ms is strictly better while still catching a dead crystal.
+#define HFCLK_STARTUP_TIMEOUT_MS    10      // 10ms: HFXO
+#define LFCLK_STARTUP_TIMEOUT_MS    1000    // 1000ms: LFXO (200-600ms typical)
 
 // ============================================================================
 // RADIO STATE
@@ -109,55 +179,74 @@ static volatile radio_state_t radio_status = RADIO_STATE_OK;
 static uint32_t tx_timeout_count = 0;
 static uint32_t total_packets_sent = 0;
 
+// last_status_rtc_tick: RTC COUNTER value at the last status packet transmission.
+// Stored at file scope (not as static local in main) so it is visible alongside
+// other module state. Zero-initialised; the first status packet fires at boot + 2min.
+static uint32_t last_status_rtc_tick = 0;
+
 // ============================================================================
 // TIMING  (RTC1, ~1ms ticks)
 //
 // PRESCALER=32: f = 32768/(32+1) = 992.97 Hz, period = 1.0071 ms
 //
 // RTC1_TICKS_PER_SEC: 993 is the closest integer to 992.97.
-//   - get_timestamp_ms() uses the raw counter and returns TICKS, not true
-//     milliseconds. Each tick is ~1.007ms. The packet timestamp field is named
-//     "milliseconds" for convenience but callers that care about precision
-//     (e.g. Phase 2 t1/t2 gap-fill interpolation) must treat it as ticks.
-//     The counter wraps at ~65535 ticks = ~66.0s (not 65.5s).
-//   - get_uptime_seconds() divides by RTC1_TICKS_PER_SEC = 993, giving <0.003%
+//   - get_rtc_ticks() returns raw RTC COUNTER bits [15:0]. Each tick = ~1.007ms.
+//     The counter wraps at ~65535 ticks = ~66.0s. For timing arithmetic, always
+//     use uint16_t subtraction so wrapping is well-defined.
+//   - get_uptime_seconds() divides by RTC1_TICKS_PER_SEC (993), giving <0.003%
 //     error. The previous value of 1000 caused 0.71% fast readout (~12.8s
 //     ahead after 30 minutes).
-//   - This 0.71% rate does not affect radio timing (hardware), packet loss
-//     stats, or any real-time decisions. It only affects elapsed-time readings
-//     if those are compared against wall time.
+//   - Packet timestamp field carries these ticks. For Phase 2 t1/t2 gap-fill
+//     interpolation, treat as ticks (not milliseconds). Each tick = ~1.007ms.
 // ============================================================================
 
 #define RTC1_TICKS_PER_SEC  993U    // 32768/33 = 992.97 Hz, rounded to nearest integer
 
 static void timing_init(void)
 {
-    NRF_CLOCK->LFCLKSRC = CLOCK_LFCLKSRC_SRC_Xtal << CLOCK_LFCLKSRC_SRC_Pos;
-    NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
-    NRF_CLOCK->TASKS_LFCLKSTART = 1;
-    while (NRF_CLOCK->EVENTS_LFCLKSTARTED == 0);
+    // nrf_drv_twi_init() (called inside sensors_init()) requests the LFCLK via
+    // nrf_drv_clock_lfclk_request(), which may have already started it by the
+    // time we get here. If we clear EVENTS_LFCLKSTARTED and reissue TASKS_LFCLKSTART
+    // on an already-running clock, the event never re-fires and the timeout triggers.
+    // Check LFCLKSTAT.STATE first; only go through the start sequence if needed.
+    bool lfclk_already_running =
+        (NRF_CLOCK->LFCLKSTAT & (CLOCK_LFCLKSTAT_STATE_Running << CLOCK_LFCLKSTAT_STATE_Pos));
+
+    if (!lfclk_already_running) {
+        NRF_CLOCK->LFCLKSRC = CLOCK_LFCLKSRC_SRC_Xtal << CLOCK_LFCLKSRC_SRC_Pos;
+        NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
+        NRF_CLOCK->TASKS_LFCLKSTART = 1;
+
+        uint32_t t = LFCLK_STARTUP_TIMEOUT_MS;
+        while (NRF_CLOCK->EVENTS_LFCLKSTARTED == 0 && t > 0) { nrf_delay_ms(1); t--; }
+        if (t == 0) {
+            SEGGER_RTT_printf(0, "FATAL: LFCLK failed to start\r\n");
+            indicate_error_fatal();
+        }
+        SEGGER_RTT_printf(0, "LFCLK started\r\n");
+    } else {
+        SEGGER_RTT_printf(0, "LFCLK already running (started by TWI driver)\r\n");
+    }
+
     NRF_RTC1->PRESCALER = 32;   // 992.97 Hz (~1ms), 0.71% slow — see note above
     NRF_RTC1->TASKS_START = 1;
-    // Allow the counter to advance past 0 before get_timestamp_ms() is first
-    // called. Without this delay, a very fast loop iteration after timing_init()
-    // could read COUNTER=0, compute a next_tx_time of 4, and immediately
-    // trigger a timing resync when COUNTER has not yet advanced by 4 ticks.
+    // Allow the counter to advance past 0 before get_rtc_ticks() is first called.
+    // Without this, a very fast loop iteration after timing_init() could read
+    // COUNTER=0, compute next_tx_time=4, and immediately trigger a timing resync.
     nrf_delay_ms(10);
 }
 
 // Returns RTC ticks as uint16_t: wraps at 65535 ticks (~66.0s at 993Hz).
-// NOTE: These are RTC ticks, not true milliseconds. Each tick = ~1.007ms.
-// Wrapping is handled correctly by uint16_t subtraction in the timing loop.
+// Each tick = ~1.007ms. Wrap arithmetic is correct by uint16_t subtraction.
 // The packet timestamp field carries these ticks directly.
-static inline uint16_t get_timestamp_ms(void)
+static inline uint16_t get_rtc_ticks(void)
 {
     return (uint16_t)(NRF_RTC1->COUNTER & 0xFFFF);
 }
 
 // Uptime in seconds. Divides by RTC1_TICKS_PER_SEC (993) for <0.003% error.
-// Previous implementation divided by 1000, which ran 0.71% fast.
-// 24-bit counter overflows at ~4.7 hours; this produces one spurious status
-// packet at that point — acceptable for a juggling performance context.
+// 24-bit counter overflows at ~4.7 hours; produces one spurious status packet
+// at that point — acceptable for a performance context.
 static uint32_t get_uptime_seconds(void)
 {
     return (uint32_t)(NRF_RTC1->COUNTER / RTC1_TICKS_PER_SEC);
@@ -183,11 +272,20 @@ static void battery_init(void)
     NRF_SAADC->ENABLE = 1;
 }
 
+// Helper: issue TASKS_STOP and wait for EVENTS_STOPPED with timeout, then clear.
+// Used by read_battery_voltage() both in the normal exit path and in all early
+// timeout returns. Without this wait, TASKS_START on the next call can race a
+// still-pending STOP, violating the nRF52840 SAADC sequencing requirement.
+static void saadc_stop_and_wait(void)
+{
+    NRF_SAADC->TASKS_STOP = 1;
+    uint32_t t = 100000;
+    while (NRF_SAADC->EVENTS_STOPPED == 0 && t > 0) { t--; }
+    NRF_SAADC->EVENTS_STOPPED = 0;
+}
+
 static uint16_t read_battery_voltage(void)
 {
-    // Timeout guards added for consistency with fsr_read() — bare polling loops
-    // could hang indefinitely if the SAADC peripheral gets into a bad state.
-    // On timeout, return 0 (treated as USB-only by the caller).
     int16_t adc;
     uint32_t timeout;
 
@@ -196,19 +294,16 @@ static uint16_t read_battery_voltage(void)
     NRF_SAADC->TASKS_START = 1;
     timeout = 100000;
     while (NRF_SAADC->EVENTS_STARTED == 0 && timeout > 0) { timeout--; }
-    if (timeout == 0) { NRF_SAADC->TASKS_STOP = 1; return 0; }
+    if (timeout == 0) { saadc_stop_and_wait(); return 0; }
     NRF_SAADC->EVENTS_STARTED = 0;
 
     NRF_SAADC->TASKS_SAMPLE = 1;
     timeout = 100000;
     while (NRF_SAADC->EVENTS_END == 0 && timeout > 0) { timeout--; }
-    if (timeout == 0) { NRF_SAADC->TASKS_STOP = 1; return 0; }
+    if (timeout == 0) { saadc_stop_and_wait(); return 0; }
     NRF_SAADC->EVENTS_END = 0;
 
-    NRF_SAADC->TASKS_STOP = 1;
-    timeout = 100000;
-    while (NRF_SAADC->EVENTS_STOPPED == 0 && timeout > 0) { timeout--; }
-    NRF_SAADC->EVENTS_STOPPED = 0;
+    saadc_stop_and_wait();
 
     if (adc < 0) return 0;
     return (uint16_t)(((uint32_t)adc * 1758) / 1000);
@@ -226,9 +321,14 @@ static uint8_t estimate_battery_percent(uint16_t mv)
 // STATUS PACKET
 // ============================================================================
 
-static uint8_t calculate_checksum(status_packet_t *p)
+static uint8_t calculate_checksum(const status_packet_t *p)
 {
-    uint8_t *b = (uint8_t *)p;
+    // XOR all bytes except the last (the checksum field itself).
+    // DEPENDENCY: this assumes 'checksum' is the final field in status_packet_t.
+    // The _Static_assert in packet_spec.h guards the struct size, not field order.
+    // If a field is added after 'checksum', this loop silently covers the wrong
+    // bytes. Any structural change to status_packet_t must be verified here.
+    const uint8_t *b = (const uint8_t *)p;
     uint8_t cs = 0;
     for (size_t i = 0; i < sizeof(status_packet_t) - 1; i++) cs ^= b[i];
     return cs;
@@ -252,7 +352,7 @@ static void transmit_status_packet(void)
     status_packet_t s;
     s.ball_id     = BALL_ID;
     s.sequence    = status_sequence++;
-    s.timestamp   = get_timestamp_ms();
+    s.timestamp   = get_rtc_ticks();
     s.packet_type = PACKET_TYPE_STATUS;
 
     // Read temperature; check sentinel before storing.
@@ -269,6 +369,10 @@ static void transmit_status_packet(void)
     s.sensor_health      = sensors_get_status_bitmask();
     s.total_packets_sent = total_packets_sent;
     s.uptime_seconds     = get_uptime_seconds();
+    // tx_timeout_count is uint32_t; radio_timeouts is uint16_t in the wire format.
+    // The narrowing is intentional — the field cannot change without breaking the
+    // on-air packet format. At 250Hz, uint16_t saturates after ~262 seconds of
+    // consecutive radio failures, which is well past the TX freeze detection point.
     s.radio_timeouts     = (uint16_t)tx_timeout_count;
     s.i2c_errors         = sensors_get_i2c_error_count();
     s.reserved           = 0;
@@ -316,20 +420,12 @@ static void transmit_status_packet(void)
 static bool radio_init(void)
 {
     // Power-cycle the radio peripheral.
-    //
-    // Delay after POWER=0 and POWER=1 increased from 10us to 1ms.
-    // 10us was insufficient for the peripheral's internal power domain to
-    // stabilise before firmware accesses its registers. With 10us, the
-    // STATE readback below could return a non-DISABLED value not because
-    // the radio was active, but because the register bus hadn't settled,
-    // causing radio_init() to return false unconditionally and forcing
-    // repeated recovery attempts. 1ms matches Nordic SDK reference examples
-    // and provides reliable stabilisation across temperature and supply variation.
+    // Delay after POWER=0/1 is 1ms. 10us was insufficient for the power domain
+    // to stabilise; STATE readback then returned non-DISABLED unconditionally.
     NRF_RADIO->POWER = 0; nrf_delay_ms(1);
     NRF_RADIO->POWER = 1; nrf_delay_ms(1);
 
     // After power-on, radio must be DISABLED before configuration.
-    // A non-DISABLED state here indicates the peripheral did not reset cleanly.
     if (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled) {
         SEGGER_RTT_printf(0, "RADIO: unexpected state 0x%lX after power cycle\r\n",
             NRF_RADIO->STATE);
@@ -365,22 +461,26 @@ static bool radio_init(void)
         (RADIO_SHORTS_READY_START_Enabled << RADIO_SHORTS_READY_START_Pos) |
         (RADIO_SHORTS_END_DISABLE_Enabled << RADIO_SHORTS_END_DISABLE_Pos);
 
-    // Verify critical configuration was written correctly.
-    // Checks registers with non-trivial values: a bus fault or unclocked
-    // peripheral will produce wrong readbacks rather than matching what we wrote.
+    // Readback verification.
+    // CRCPOLY and CRCINIT are included: a wrong CRC polynomial causes the RX to
+    // drop every packet on CRC failure with no error logged on either side.
     bool mode_ok    = (NRF_RADIO->MODE ==
                         (RADIO_MODE_MODE_Nrf_2Mbit << RADIO_MODE_MODE_Pos));
     bool freq_ok    = (NRF_RADIO->FREQUENCY == RF_CHANNEL);
     bool payload_ok = (((NRF_RADIO->PCNF1 >> RADIO_PCNF1_STATLEN_Pos) & 0xFF)
                         == PACKET_PAYLOAD_SIZE);
     bool addr_ok    = (NRF_RADIO->BASE0 == RADIO_BASE_ADDR);
+    bool crc_poly_ok = (NRF_RADIO->CRCPOLY == CRC_POLYNOMIAL);
+    bool crc_init_ok = (NRF_RADIO->CRCINIT == CRC_INIT_VALUE);
 
-    if (!mode_ok)    SEGGER_RTT_printf(0, "RADIO: MODE readback mismatch\r\n");
-    if (!freq_ok)    SEGGER_RTT_printf(0, "RADIO: FREQUENCY readback mismatch\r\n");
-    if (!payload_ok) SEGGER_RTT_printf(0, "RADIO: PCNF1 STATLEN readback mismatch\r\n");
-    if (!addr_ok)    SEGGER_RTT_printf(0, "RADIO: BASE0 readback mismatch\r\n");
+    if (!mode_ok)     SEGGER_RTT_printf(0, "RADIO: MODE readback mismatch\r\n");
+    if (!freq_ok)     SEGGER_RTT_printf(0, "RADIO: FREQUENCY readback mismatch\r\n");
+    if (!payload_ok)  SEGGER_RTT_printf(0, "RADIO: PCNF1 STATLEN readback mismatch\r\n");
+    if (!addr_ok)     SEGGER_RTT_printf(0, "RADIO: BASE0 readback mismatch\r\n");
+    if (!crc_poly_ok) SEGGER_RTT_printf(0, "RADIO: CRCPOLY readback mismatch\r\n");
+    if (!crc_init_ok) SEGGER_RTT_printf(0, "RADIO: CRCINIT readback mismatch\r\n");
 
-    return (mode_ok && freq_ok && payload_ok && addr_ok);
+    return (mode_ok && freq_ok && payload_ok && addr_ok && crc_poly_ok && crc_init_ok);
 }
 
 static bool transmit_packet(void)
@@ -391,16 +491,15 @@ static bool transmit_packet(void)
     NRF_RADIO->EVENTS_END      = 0;
     NRF_RADIO->EVENTS_DISABLED = 0;
 
-    // __DMB() (Data Memory Barrier) flushes the Cortex-M4 write buffer before
-    // the DMA transfer begins. Without this, stores to tx_packet in SRAM may
-    // still be pending in the write buffer when TASKS_TXEN triggers the radio
-    // DMA, causing stale or partially-updated data to be transmitted.
-    // The barrier must appear after the last write to tx_packet (in
-    // prepare_packet()) and before TASKS_TXEN.
+    // __DMB() flushes the Cortex-M4 write buffer so all stores to tx_packet are
+    // visible to the bus fabric before DMA starts. Must appear after the last
+    // write to tx_packet (prepare_packet()) and before TASKS_TXEN.
     __DMB();
     NRF_RADIO->TASKS_TXEN = 1;
 
-    t = 1000;
+    // READY timeout (1ms): radio ramp-up from DISABLED is fast. Deliberately
+    // shorter than RADIO_TIMEOUT_US (5ms) used for END/DISABLED.
+    t = RADIO_READY_TIMEOUT_US;
     while (!NRF_RADIO->EVENTS_READY && t > 0) { nrf_delay_us(10); t -= 10; }
     if (!t) {
         SEGGER_RTT_printf(0, "RADIO: never reached READY\r\n");
@@ -440,36 +539,14 @@ static void indicate_error_fatal(void)
     }
 }
 
-// indicate_error_radio() removed.
-//
-// It was called from recover_radio() when radio_init() failed after a TX
-// timeout. The function blocked for 3 seconds and returned, at which point
-// the main loop called transmit_packet() immediately, failed again, called
-// recover_radio() again, failed again, and blocked for another 3 seconds.
-// This produced a cascade of 3-second blockages rather than recovery.
-//
-// The 1Hz LED heartbeat toggled in the main loop provides sufficient liveness
-// indication. A frozen heartbeat means the radio is stuck. Removing
-// indicate_error_radio() allows the main loop to continue cycling, which
-// gives recover_radio() repeated chances to succeed (e.g. if the failure
-// was a transient bus glitch rather than a hard hardware fault).
+// indicate_error_radio() removed in v3.3. See changelog.
 
 static void recover_radio(void)
 {
     SEGGER_RTT_printf(0, "Radio: attempting recovery...\r\n");
 
-    // Issue TASKS_DISABLE and wait for EVENTS_DISABLED before reinitialising.
-    //
-    // Previously: TASKS_DISABLE = 1; nrf_delay_ms(1); radio_init();
-    // The 1ms sleep was a guess. If the radio was mid-transmission when a
-    // timeout fired, the disable sequence could take longer than 1ms to
-    // complete. radio_init() then power-cycled the peripheral and checked
-    // STATE == DISABLED; if DISABLED hadn't arrived yet, the readback was
-    // wrong and radio_init() returned false, making recovery always fail.
-    //
-    // Polling EVENTS_DISABLED is the correct approach. The event is set by
-    // hardware when the radio has fully disabled. Timeout of 10ms is
-    // conservative; the disable sequence is typically complete in <1ms.
+    // Poll EVENTS_DISABLED before power-cycling. Timeout 10ms is conservative;
+    // the disable sequence is typically complete in <1ms.
     NRF_RADIO->TASKS_DISABLE = 1;
 
     uint32_t t = 10000;  // 10ms in 1us steps
@@ -482,12 +559,8 @@ static void recover_radio(void)
     if (!radio_init()) {
         radio_status = RADIO_STATE_STARTUP_FAILED;
         SEGGER_RTT_printf(0, "Radio: recovery FAILED — will retry next TX cycle\r\n");
-        // Do not call indicate_error_radio() here. See note above.
-        // The main loop will attempt transmit_packet() next iteration,
-        // which will fail and call recover_radio() again. This is the
-        // desired behaviour: repeated recovery attempts rather than
-        // cascading 3-second blockages.
     } else {
+        radio_status = RADIO_STATE_OK;
         SEGGER_RTT_printf(0, "Radio: recovered\r\n");
     }
 }
@@ -507,12 +580,17 @@ static void prepare_packet(void)
 {
     tx_packet.ball_id   = BALL_ID;
     tx_packet.sequence  = packet_sequence++;
-    tx_packet.timestamp = get_timestamp_ms();
+    // Timestamp is taken here, after sensors_read() has completed.
+    // I2C reads take ~1ms; at 4ms TX interval the timestamp is ~25% stale
+    // relative to the actual sensor sample time. For Phase 2 gap-fill
+    // interpolation, use the sequence number rather than the timestamp field
+    // to determine packet position — sequence is set before any blocking work.
+    tx_packet.timestamp = get_rtc_ticks();
     memcpy(&tx_packet.data_t0, &sensor_history[0], sizeof(sensor_data_t));
     memcpy(&tx_packet.data_t1, &sensor_history[1], sizeof(sensor_data_t));
     memcpy(&tx_packet.data_t2, &sensor_history[2], sizeof(sensor_data_t));
-    // Note: __DMB() is called in transmit_packet() before TASKS_TXEN,
-    // after all writes to tx_packet are complete.
+    // __DMB() is called in transmit_packet() before TASKS_TXEN, after all
+    // writes to tx_packet are complete.
 }
 
 // ============================================================================
@@ -529,23 +607,29 @@ int main(void)
 
     sensor_data_t current_sensors;
     uint32_t loop_count = 0;
-    uint32_t current_time_ms;
-
-    // uint16_t so wrapping arithmetic in the timing section is well-defined
+    uint16_t current_ticks;   // return type of get_rtc_ticks()
     uint16_t next_tx_time;
 
     // HFCLK required for radio. TX does not use nrf_drv_clock (no USB stack),
     // so direct register access is appropriate here.
     NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
     NRF_CLOCK->TASKS_HFCLKSTART = 1;
-    while (NRF_CLOCK->EVENTS_HFCLKSTARTED == 0);
-
+    {
+        uint32_t t = HFCLK_STARTUP_TIMEOUT_MS;
+        while (NRF_CLOCK->EVENTS_HFCLKSTARTED == 0 && t > 0) { nrf_delay_ms(1); t--; }
+        if (t == 0) {
+            // LED init not yet done — drive pin directly before halting.
+            NRF_P1->DIRSET = (1 << LED_PIN);
+            SEGGER_RTT_printf(0, "FATAL: HFCLK failed to start\r\n");
+            indicate_error_fatal();
+        }
+    }
     // LED
     NRF_P1->DIRSET = (1 << LED_PIN);
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.5 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.9 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));
@@ -564,7 +648,16 @@ int main(void)
     if (a_bmp)   SEGGER_RTT_printf(0, " BMP=0x%02X",   a_bmp);
     SEGGER_RTT_printf(0, "\r\n");
 
-    // Timing
+    // WHO_AM_I re-reads after init, verifying sensors still respond post-config.
+    // Non-fatal: sensors_init() already confirmed core sensors; this is a
+    // belt-and-suspenders check. A failure here is logged but does not halt.
+    if (!sensors_test()) {
+        SEGGER_RTT_printf(0, "WARNING: sensors_test() failed — one or more sensors may have lost comms after init\r\n");
+    } else {
+        SEGGER_RTT_printf(0, "sensors_test() OK\r\n");
+    }
+
+    // Timing (LFCLK start with timeout inside timing_init)
     timing_init();
 
     // Battery (sets SAADC to 12-bit; must run after sensors_init)
@@ -595,19 +688,17 @@ int main(void)
     SEGGER_RTT_printf(0, "Transmitting at 250Hz (4ms). Status every %us.\r\n\r\n",
         STATUS_INTERVAL_SEC);
 
-    // Timing initialisation
-    next_tx_time = get_timestamp_ms() + TX_INTERVAL_MS;
-    static uint32_t last_status_rtc_tick = 0;
+    next_tx_time = get_rtc_ticks() + TX_INTERVAL_MS;
 
     while (1)
     {
-        current_time_ms = get_timestamp_ms();
+        current_ticks = get_rtc_ticks();
 
         // Debug timing: print once per second (250 loops at 250Hz)
-        if (loop_count == 0 || loop_count % 250 == 0) {
-            int32_t diff = (int32_t)((int16_t)(next_tx_time - (uint16_t)current_time_ms));
+        if (loop_count % 250 == 0) {
+            int32_t diff = (int32_t)((int16_t)(next_tx_time - current_ticks));
             SEGGER_RTT_printf(0, "DEBUG: loop=%u T=%u next=%u diff=%d\r\n",
-                loop_count, (uint16_t)current_time_ms, next_tx_time, diff);
+                loop_count, current_ticks, next_tx_time, diff);
         }
 
         // Read -> history -> packet
@@ -618,8 +709,6 @@ int main(void)
         // Sensor values printed once per second
         if (loop_count % 250 == 0) {
             // Decode H3LIS using extract_h3lis_axis() from packet_spec.h.
-            // Uses unsigned right shift (well-defined in C) then explicit sign
-            // extension from bit 11 — avoids implementation-defined signed shift.
             int16_t hx = extract_h3lis_axis(current_sensors.h3lis_x_fsr_level);
             int16_t hy = extract_h3lis_axis(current_sensors.h3lis_y_fsr_pattern);
             int16_t hz = extract_h3lis_axis(current_sensors.h3lis_z_flags);
@@ -663,9 +752,7 @@ int main(void)
         }
 
         // Status packet every STATUS_INTERVAL_SEC seconds.
-        // Compare RTC ticks directly - avoids a 32-bit divide at 250Hz.
-        // Subtraction masked to 24 bits handles the RTC counter hardware
-        // wrap at 0xFFFFFF (~4.7 hours at 993Hz).
+        // Subtraction masked to 24 bits handles the RTC counter wrap at 0xFFFFFF.
         if (((NRF_RTC1->COUNTER - last_status_rtc_tick) & 0xFFFFFFU)
                 >= STATUS_INTERVAL_TICKS) {
             transmit_status_packet();
@@ -682,23 +769,20 @@ int main(void)
                 NRF_P1->OUTSET = (1 << LED_PIN);
         }
 
-        // Precision timing
-        // next_tx_time and current_time_ms are both uint16_t so subtraction
+        // Precision timing.
+        // next_tx_time and current_ticks are both uint16_t so subtraction
         // wraps correctly at the 65535-tick boundary (~66.0s at 993Hz).
         next_tx_time += TX_INTERVAL_MS;
-        current_time_ms = get_timestamp_ms();
-        int32_t time_diff = (int32_t)((int16_t)(next_tx_time - (uint16_t)current_time_ms));
+        current_ticks = get_rtc_ticks();
+        int32_t time_diff = (int32_t)((int16_t)(next_tx_time - current_ticks));
 
         if (time_diff > 0 && time_diff < 100) {
             nrf_delay_ms((uint32_t)time_diff);
         } else if (time_diff >= 100 || time_diff < -100) {
-            // Resync on any large deviation in either direction.
-            // Large positive: startup artifact or clock glitch.
-            // Large negative: main loop stalled (e.g. slow I2C on first BMP read).
-            // Without this catch, a large negative diff causes the loop to run
-            // flat-out trying to catch up, temporarily doubling the TX rate.
+            // Resync on large deviation. Large negative: loop stalled (e.g. slow
+            // I2C on first BMP read). Large positive: startup artifact or glitch.
             SEGGER_RTT_printf(0, "WARN: timing resync (diff=%d)\r\n", time_diff);
-            next_tx_time = (uint16_t)current_time_ms + TX_INTERVAL_MS;
+            next_tx_time = current_ticks + TX_INTERVAL_MS;
         }
         // time_diff 0..-100: slightly behind, transmit immediately next iteration
     }

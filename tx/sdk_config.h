@@ -3112,6 +3112,40 @@
 // </h> 
 //==========================================================
 
+
+// <h> segger_rtt - SEGGER RTT
+//==========================================================
+// <o> SEGGER_RTT_CONFIG_BUFFER_SIZE_UP - Size of upstream buffer (target to host).
+#ifndef SEGGER_RTT_CONFIG_BUFFER_SIZE_UP
+#define SEGGER_RTT_CONFIG_BUFFER_SIZE_UP 512
+#endif
+
+// <o> SEGGER_RTT_CONFIG_MAX_NUM_UP_BUFFERS - Maximum number of upstream buffers.
+#ifndef SEGGER_RTT_CONFIG_MAX_NUM_UP_BUFFERS
+#define SEGGER_RTT_CONFIG_MAX_NUM_UP_BUFFERS 2
+#endif
+
+// <o> SEGGER_RTT_CONFIG_BUFFER_SIZE_DOWN - Size of downstream buffer (host to target).
+#ifndef SEGGER_RTT_CONFIG_BUFFER_SIZE_DOWN
+#define SEGGER_RTT_CONFIG_BUFFER_SIZE_DOWN 16
+#endif
+
+// <o> SEGGER_RTT_CONFIG_MAX_NUM_DOWN_BUFFERS - Maximum number of downstream buffers.
+#ifndef SEGGER_RTT_CONFIG_MAX_NUM_DOWN_BUFFERS
+#define SEGGER_RTT_CONFIG_MAX_NUM_DOWN_BUFFERS 2
+#endif
+
+// <o> SEGGER_RTT_CONFIG_DEFAULT_MODE - RTT transfer mode for buffer 0.
+// <0=> SKIP  - Drop data if buffer full. Non-blocking. Correct for real-time loop.
+// <1=> TRIM  - Write as much as fits, drop remainder.
+// <2=> BLOCK_IF_FIFO_FULL - Block until host reads. Will stall main loop if no viewer attached.
+// Set to 0 (SKIP): TX loop must not block on RTT when J-Link viewer is absent.
+#ifndef SEGGER_RTT_CONFIG_DEFAULT_MODE
+#define SEGGER_RTT_CONFIG_DEFAULT_MODE 0
+#endif
+// </h>
+//==========================================================
+
 // <<< end of configuration section >>>
 #endif //SDK_CONFIG_H
 
