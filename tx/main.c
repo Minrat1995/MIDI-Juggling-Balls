@@ -13,9 +13,19 @@
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
  *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
  *
- * @version 3.9
+ * @version 3.11
  *
- * Changelog from 3.8:
+ * Changelog from 3.10:
+ *   - sensors.c: raw byte assembly corrected at all 12 sites (gyro×3, accel×3,
+ *     mag×3, H3LIS×3). See sensors.c changelog for full explanation. No
+ *     behaviour change on GCC/Cortex-M4; removes C99/C11 non-conformance.
+ *
+ * Changelog from 3.9:
+ *   - radio_init(): PREFIX0 added to readback verification. A PREFIX0 mismatch
+ *     produces the same symptom as wrong CRCPOLY — silent dead link with no error
+ *     logged on either side. BASE0 was already verified; PREFIX0 completes the
+ *     address readback.
+ *
  *   - CLOCK_STARTUP_TIMEOUT_MS comment corrected: said "10000 iterations at 1ms
  *     each" — the loop decrements from 10 with nrf_delay_ms(1) per iteration,
  *     giving 10 iterations × 1ms = 10ms total. The value was always correct;
@@ -464,12 +474,15 @@ static bool radio_init(void)
     // Readback verification.
     // CRCPOLY and CRCINIT are included: a wrong CRC polynomial causes the RX to
     // drop every packet on CRC failure with no error logged on either side.
+    // PREFIX0 is included for the same reason: a mismatch causes the same silent
+    // dead link as a wrong CRC polynomial.
     bool mode_ok    = (NRF_RADIO->MODE ==
                         (RADIO_MODE_MODE_Nrf_2Mbit << RADIO_MODE_MODE_Pos));
     bool freq_ok    = (NRF_RADIO->FREQUENCY == RF_CHANNEL);
     bool payload_ok = (((NRF_RADIO->PCNF1 >> RADIO_PCNF1_STATLEN_Pos) & 0xFF)
                         == PACKET_PAYLOAD_SIZE);
     bool addr_ok    = (NRF_RADIO->BASE0 == RADIO_BASE_ADDR);
+    bool prefix_ok  = (NRF_RADIO->PREFIX0 == RADIO_PREFIX_ADDR);
     bool crc_poly_ok = (NRF_RADIO->CRCPOLY == CRC_POLYNOMIAL);
     bool crc_init_ok = (NRF_RADIO->CRCINIT == CRC_INIT_VALUE);
 
@@ -477,10 +490,11 @@ static bool radio_init(void)
     if (!freq_ok)     SEGGER_RTT_printf(0, "RADIO: FREQUENCY readback mismatch\r\n");
     if (!payload_ok)  SEGGER_RTT_printf(0, "RADIO: PCNF1 STATLEN readback mismatch\r\n");
     if (!addr_ok)     SEGGER_RTT_printf(0, "RADIO: BASE0 readback mismatch\r\n");
+    if (!prefix_ok)   SEGGER_RTT_printf(0, "RADIO: PREFIX0 readback mismatch\r\n");
     if (!crc_poly_ok) SEGGER_RTT_printf(0, "RADIO: CRCPOLY readback mismatch\r\n");
     if (!crc_init_ok) SEGGER_RTT_printf(0, "RADIO: CRCINIT readback mismatch\r\n");
 
-    return (mode_ok && freq_ok && payload_ok && addr_ok && crc_poly_ok && crc_init_ok);
+    return (mode_ok && freq_ok && payload_ok && addr_ok && prefix_ok && crc_poly_ok && crc_init_ok);
 }
 
 static bool transmit_packet(void)
@@ -629,7 +643,7 @@ int main(void)
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.9 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.11 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));

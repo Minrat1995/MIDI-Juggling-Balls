@@ -2,6 +2,19 @@
  * Sensors Module Implementation
  *
  * Fixes applied across review and hardware validation sessions:
+ *   - sensors_read(): raw byte assembly corrected at all 12 sites (gyro×3,
+ *     accel×3, mag×3, H3LIS×3). Previous form (int16_t)(raw[0] | (raw[1]<<8))
+ *     is implementation-defined in C99/C11 when raw[1] >= 128 because the
+ *     implicit int promotion of uint8_t raw[1] shifts into the sign bit of int.
+ *     Corrected form: (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1]<<8)).
+ *     Casting to uint16_t before shifting keeps the arithmetic in the unsigned
+ *     domain; the outer int16_t cast is then a well-defined two's complement
+ *     truncation on any conforming C99/C11 implementation.
+ *     No behaviour change on GCC/Cortex-M4 (int is 32-bit; shift never reaches
+ *     sign bit of int), but removes the standard non-conformance.
+ *     NOTE: this fix was listed in the bugs fixed table since an earlier session
+ *     but had not been applied to the code. The table entry was accurate as of
+ *     this version.
  *   - LIS3MDL burst read: | 0x80 on register address (was reading X-low 6x)
  *   - CTRL2_G: 0x64 for +/-500dps (was 0x68 = +/-1000dps)
  *   - CTRL3_C: BDU + IF_INC enabled on LSM6DSOX (prevents split-sample reads)
@@ -23,6 +36,19 @@
  *   - fsr_read disabled code converted from block comment to #if 0 / #endif.
  *   - BMP_OSR_CONFIG_VAL comment corrected (bit positions and OSR_T value).
  *   - BMP_ODR_CONFIG_VAL comment: removed incorrect PRESS_EN attribution.
+ *   - fsr_read (#if 0 Phase 3 block): MAXCNT corrected from 4 to 5 and result
+ *     extraction changed to read adc_values[1..4] instead of [0..3]. battery_init()
+ *     configures CH[0] (VBAT); the SAADC scans CH[0..4] in order with MAXCNT=5,
+ *     so adc_values[0] is a battery sample that must be discarded. With the old
+ *     MAXCNT=4, CH[4] (FSR3) was never sampled and battery data appeared as FSR0.
+ *   - fsr_read (#if 0 Phase 3 block): all three SAADC timeout error paths now
+ *     stop the peripheral cleanly before returning. Previously: STARTED and END
+ *     timeout paths returned without issuing TASKS_STOP (SAADC left running);
+ *     STOPPED timeout path returned without clearing EVENTS_STOPPED (stale event
+ *     would cause subsequent saadc_stop_and_wait() in read_battery_voltage() to
+ *     return immediately before the peripheral had actually stopped). EVENTS_STOPPED
+ *     is now cleared unconditionally after the stop-wait loop on both success and
+ *     timeout paths.
  *   - h3lis_z_flags: removed redundant | 0; added comment for reserved nibble.
  *   - i2c_read_regs: added note about double-count i2c_error_count behaviour.
  *   - sensors_read() LSM6DSOX: both gyro and accel now independently contribute
@@ -266,7 +292,15 @@ static bool fsr_read(uint16_t *fsr_out)
             FSR0 -> P0.03 (SAADC Ch1)
             FSR1 -> P0.04 (SAADC Ch2)
             FSR2 -> P0.05 (SAADC Ch3)
-            FSR3 -> P0.28 (SAADC Ch4)  */
+            FSR3 -> P0.28 (SAADC Ch4)
+
+          CHANNEL SCAN LAYOUT — read this before modifying:
+          battery_init() (main.c) configures CH[0] with PSELP=VBAT. The SAADC
+          scans configured channels in index order (CH[0], CH[1], ...) and stops
+          after MAXCNT results. With CH[0..4] all active, MAXCNT must be 5 to
+          capture all channels. adc_values[0] is the battery read (discarded);
+          FSR0..FSR3 are in adc_values[1..4]. Do NOT use MAXCNT=4 — that drops
+          FSR3 entirely and maps battery data into FSR0's slot.  */
 
     if (!fsr_initialized) {
         memset(fsr_out, 0, 4 * sizeof(uint16_t));
@@ -276,14 +310,21 @@ static bool fsr_read(uint16_t *fsr_out)
     uint32_t saved_res = NRF_SAADC->RESOLUTION;
     NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_10bit;
 
-    int16_t adc_values[4];
+    // 5 elements: [0]=battery (CH0, discarded), [1..4]=FSR0..FSR3 (CH1..4).
+    // See channel scan layout note above.
+    int16_t adc_values[5];
     NRF_SAADC->RESULT.PTR    = (uint32_t)adc_values;
-    NRF_SAADC->RESULT.MAXCNT = 4;
+    NRF_SAADC->RESULT.MAXCNT = 5;
     NRF_SAADC->TASKS_START = 1;
 
     uint32_t timeout = 100000;
     while (NRF_SAADC->EVENTS_STARTED == 0 && timeout > 0) { timeout--; }
     if (timeout == 0) {
+        // SAADC may have started — stop it cleanly before returning.
+        NRF_SAADC->TASKS_STOP = 1;
+        uint32_t t2 = 100000;
+        while (NRF_SAADC->EVENTS_STOPPED == 0 && t2 > 0) { t2--; }
+        NRF_SAADC->EVENTS_STOPPED = 0;
         NRF_SAADC->RESOLUTION = saved_res;
         memset(fsr_out, 0, 4 * sizeof(uint16_t));
         return false;
@@ -294,6 +335,11 @@ static bool fsr_read(uint16_t *fsr_out)
     timeout = 100000;
     while (NRF_SAADC->EVENTS_END == 0 && timeout > 0) { timeout--; }
     if (timeout == 0) {
+        // SAADC is running — stop it cleanly before returning.
+        NRF_SAADC->TASKS_STOP = 1;
+        uint32_t t2 = 100000;
+        while (NRF_SAADC->EVENTS_STOPPED == 0 && t2 > 0) { t2--; }
+        NRF_SAADC->EVENTS_STOPPED = 0;
         NRF_SAADC->RESOLUTION = saved_res;
         memset(fsr_out, 0, 4 * sizeof(uint16_t));
         return false;
@@ -303,18 +349,24 @@ static bool fsr_read(uint16_t *fsr_out)
 
     timeout = 100000;
     while (NRF_SAADC->EVENTS_STOPPED == 0 && timeout > 0) { timeout--; }
+    // Clear EVENTS_STOPPED whether or not we timed out. A stale set event would
+    // cause the next saadc_stop_and_wait() call (in read_battery_voltage) to
+    // return immediately before the peripheral has actually stopped.
+    NRF_SAADC->EVENTS_STOPPED = 0;
     if (timeout == 0) {
         NRF_SAADC->RESOLUTION = saved_res;
         memset(fsr_out, 0, 4 * sizeof(uint16_t));
         return false;
     }
-    NRF_SAADC->EVENTS_STOPPED = 0;
     NRF_SAADC->RESOLUTION = saved_res;
 
+    // adc_values[0] is the battery channel (CH0) — discard it.
+    // FSR0..FSR3 are in adc_values[1..4] (CH1..4).
     for (int i = 0; i < 4; i++) {
-        if      (adc_values[i] < 0)    fsr_out[i] = 0;
-        else if (adc_values[i] > 1023) fsr_out[i] = 1023;
-        else                           fsr_out[i] = (uint16_t)adc_values[i];
+        int16_t v = adc_values[i + 1];
+        if      (v < 0)    fsr_out[i] = 0;
+        else if (v > 1023) fsr_out[i] = 1023;
+        else               fsr_out[i] = (uint16_t)v;
     }
     return true;
 
@@ -646,9 +698,9 @@ void sensors_read(sensor_data_t *data)
     bool lsm6_ok = true;
 
     if (i2c_read_regs(lsm6_addr, LSM6_OUTX_L_G, raw, 6)) {
-        data->imu.gyro[0] = (int16_t)(raw[0] | (raw[1] << 8));
-        data->imu.gyro[1] = (int16_t)(raw[2] | (raw[3] << 8));
-        data->imu.gyro[2] = (int16_t)(raw[4] | (raw[5] << 8));
+        data->imu.gyro[0] = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
+        data->imu.gyro[1] = (int16_t)((uint16_t)raw[2] | ((uint16_t)raw[3] << 8));
+        data->imu.gyro[2] = (int16_t)((uint16_t)raw[4] | ((uint16_t)raw[5] << 8));
     } else {
         memset(data->imu.gyro, 0, sizeof(data->imu.gyro));
         lsm6_ok = false;
@@ -656,9 +708,9 @@ void sensors_read(sensor_data_t *data)
 
     // LSM6DSOX accel (auto-increment, no special flag needed on LSM6DSOX)
     if (i2c_read_regs(lsm6_addr, LSM6_OUTX_L_A, raw, 6)) {
-        data->imu.accel[0] = (int16_t)(raw[0] | (raw[1] << 8));
-        data->imu.accel[1] = (int16_t)(raw[2] | (raw[3] << 8));
-        data->imu.accel[2] = (int16_t)(raw[4] | (raw[5] << 8));
+        data->imu.accel[0] = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
+        data->imu.accel[1] = (int16_t)((uint16_t)raw[2] | ((uint16_t)raw[3] << 8));
+        data->imu.accel[2] = (int16_t)((uint16_t)raw[4] | ((uint16_t)raw[5] << 8));
     } else {
         memset(data->imu.accel, 0, sizeof(data->imu.accel));
         lsm6_ok = false;
@@ -673,9 +725,9 @@ void sensors_read(sensor_data_t *data)
     // same register (X-low) 6 times. LSM6DSOX does not require this flag.
     if (lis3_addr != 0) {
         if (i2c_read_regs(lis3_addr, LIS3_OUT_X_L | 0x80, raw, 6)) {
-            data->imu.mag[0] = (int16_t)(raw[0] | (raw[1] << 8));
-            data->imu.mag[1] = (int16_t)(raw[2] | (raw[3] << 8));
-            data->imu.mag[2] = (int16_t)(raw[4] | (raw[5] << 8));
+            data->imu.mag[0] = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
+            data->imu.mag[1] = (int16_t)((uint16_t)raw[2] | ((uint16_t)raw[3] << 8));
+            data->imu.mag[2] = (int16_t)((uint16_t)raw[4] | ((uint16_t)raw[5] << 8));
             runtime_sensor_status |= SENSOR_LIS3_OK;
         } else {
             memset(data->imu.mag, 0, sizeof(data->imu.mag));
@@ -715,9 +767,9 @@ void sensors_read(sensor_data_t *data)
 
         if (h3lis_ok) {
             h3lis_consecutive_failures = 0;
-            h3lis_raw[0] = (int16_t)(raw[0] | (raw[1] << 8));
-            h3lis_raw[1] = (int16_t)(raw[2] | (raw[3] << 8));
-            h3lis_raw[2] = (int16_t)(raw[4] | (raw[5] << 8));
+            h3lis_raw[0] = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
+            h3lis_raw[1] = (int16_t)((uint16_t)raw[2] | ((uint16_t)raw[3] << 8));
+            h3lis_raw[2] = (int16_t)((uint16_t)raw[4] | ((uint16_t)raw[5] << 8));
 
             // fsr_read() always returns false and writes zeros until Phase 3.
             // Return value discarded: a false return with zero fsr_raw is

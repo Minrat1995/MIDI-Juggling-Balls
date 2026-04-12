@@ -1,6 +1,6 @@
 # MIDI Juggling Balls — Project Reference
 
-**Version:** Post exhaustive TX code review (TX v3.9, RX v1.5, Decoder v1.6, full pipeline validated clean)
+**Version:** Post exhaustive TX code review (TX v3.11, RX v1.5, Decoder v1.6, full pipeline validated clean)
 **Goal:** Wireless juggling ball → sensor data → sound reinforcing visual performance
 **Repo:** https://github.com/Minrat1995/MIDI-Juggling-Balls (private)
 **Target:** <20ms perceived latency, <1% packet loss, scalable to 3+ balls
@@ -10,14 +10,19 @@
 ## CURRENT STATUS
 
 ### What is done
-- TX firmware v3.9: exhaustive two-round code review complete. All identified issues
+- TX firmware v3.11: exhaustive multi-round code review complete. All identified issues
   resolved. Validated running on hardware (RTT confirmed, all sensors OK, pipeline clean).
-  Code considered production-ready pending RX equivalent review.
-  Key fixes across v3.7–v3.9: CRCPOLY/CRCINIT readback added to radio_init; sensors_test()
-  called at startup; get_timestamp_ms() renamed get_rtc_ticks(); HFCLK/LFCLK startup
-  timeouts (10ms/1000ms); saadc_stop_and_wait() helper for correct SAADC sequencing;
-  LSM6DSOX status bit symmetry; recover_radio() status reset; forward declaration for
-  indicate_error_fatal(); duplicate forward declaration removed.
+  TX has run for 2+ hours without freeze on J-Link RTT — freeze issue may be resolved or
+  intermittent; continue monitoring under extended conditions.
+  Code considered production-ready pending watchdog addition and RX equivalent review.
+  Key fixes across v3.7–v3.11: CRCPOLY/CRCINIT/PREFIX0 readback added to radio_init;
+  sensors_test() called at startup; get_timestamp_ms() renamed get_rtc_ticks();
+  HFCLK/LFCLK startup timeouts (10ms/1000ms); saadc_stop_and_wait() helper for correct
+  SAADC sequencing; LSM6DSOX status bit symmetry; recover_radio() status reset;
+  forward declaration for indicate_error_fatal(); duplicate forward declaration removed;
+  Phase 3 fsr_read SAADC scan layout corrected (MAXCNT=5, skip CH0 battery sample);
+  Phase 3 fsr_read SAADC timeout error paths all leave clean peripheral state;
+  raw byte assembly corrected at all 12 sensor read sites (well-defined C99/C11).
 - RX firmware v1.5: end-to-end radio validated, ~1-2% RF packet loss benchtop. **Exhaustive
   code review not yet performed — queue for next session (same process as TX).**
 - USB framing: confirmed working end-to-end. 0 resyncs, decoder queue drops = 0
@@ -35,11 +40,12 @@
 4. Success criterion: move ball, hear sensor data drive audio in real time
 
 ### Known open issue — TX freeze after ~10-15 minutes
-Observed again this session: TX RTT goes silent, requires manual restart. The radio recovery
-cascade fix in v3.4 was not the root cause. Genuine TWI driver hang (nrf_drv_twi blocking on
-Errata 89/121) is the most likely remaining cause. Continue monitoring.
+Observed in earlier sessions: TX RTT goes silent, requires manual restart. Most recent
+extended run (2+ hours) completed without freezing. Status uncertain — may be resolved,
+or may be intermittent. Genuine TWI driver hang (nrf_drv_twi blocking on Errata 89/121)
+remains the most likely cause if it recurs. Watchdog (NVIC_SystemReset()) still planned
+before Phase 2 extended testing as belt-and-suspenders.
 Diagnostic: when freeze occurs, note whether TX RTT is also silent (confirms TX-side cause).
-Fix planned: NVIC_SystemReset() watchdog before Phase 2 extended testing.
 
 ### RF loss pattern observed
 Benchtop loss settles in one of two stable states: ~1-2% or <0.5%. Transitions are abrupt
@@ -242,6 +248,10 @@ Shortcuts:   READY→START, END→DISABLE, DISABLED→RXEN (RX auto-loop)
 - Channels 1-4: FSR0-3 (configured but disabled until Phase 3 wiring)
 - **FSR reads must save/restore 12-bit resolution — FSR calibration is 10-bit**
 - FSR_CONTACT_THRESHOLD = 80, intensity >> 6 scaling: calibrated for 10-bit ADC
+- **Phase 3 SAADC scan layout:** CH[0] (battery) remains configured during FSR reads.
+  SAADC scans CH[0..4] in order; fsr_read() uses MAXCNT=5 and discards adc_values[0]
+  (battery). FSR0..FSR3 are in adc_values[1..4]. Do NOT change MAXCNT to 4 — that
+  drops FSR3 and maps the battery sample into FSR0's slot.
 
 ### runtime_sensor_status behavior
 SENSOR_LSM6_OK is cleared on any single I2C read failure during sensors_read()
@@ -307,7 +317,7 @@ MIDI (discrete events, Phase 2):
 
 After flashing TX, connect J-Link and open RTT terminal. Expected startup:
 ```
-=== Juggling Ball TX (Ball 1) v3.6 ===
+=== Juggling Ball TX (Ball 1) v3.11 ===
 Packet sizes:
   radio_packet_t: 86 (expect 86)      <- must match
   sensor_data_t:  27 (expect 27)      <- must match
@@ -438,7 +448,7 @@ Acceptable benchtop results:
 | BMP_ODR_CONFIG_VAL comment said PRESS_EN=1 (TX) | sensors.c (TX) | PRESS_EN is in OSR_CONFIG (0x36), not ODR_CONFIG (0x37). Wrong label on wrong register; dangerous given PRESS_EN debugging history. Fix: corrected comment |
 | init_bmp581() readback printed but not checked (TX) | sensors.c (TX) | Silent OSR_CONFIG write failure would leave PRESS_EN=0; init_bmp581() still returned true. Fix: compare readback, return false on mismatch — consistent with radio_init() discipline |
 | SENSOR_LSM6_OK not set on accel read success (TX) | sensors.c (TX) | Gyro success set the bit; accel success did not. Fragile to read-order changes. Fix: set SENSOR_LSM6_OK in both success paths |
-| Raw byte assembly (int16_t)(raw[0] \| (raw[1]<<8)) (TX) | sensors.c (TX) | Implementation-defined when raw[1]>=128 in C99/C11; same class of UB as extract_h3lis_axis. Fix: (int16_t)((uint16_t)raw[0] \| ((uint16_t)raw[1]<<8)) at all 12 sites (gyro/accel/mag/h3lis) |
+| Raw byte assembly `(int16_t)(raw[0] \| (raw[1]<<8))` (TX) | sensors.c (TX) | Implementation-defined in C99/C11 when raw[1]>=128 — implicit int promotion shifts into sign bit. Fix applied in v3.11: `(int16_t)((uint16_t)raw[0] \| ((uint16_t)raw[1]<<8))` at all 12 sites (gyro/accel/mag/H3LIS). No behaviour change on GCC/Cortex-M4. |
 | sensors_test() never called (TX) | main.c (TX) | Dead public API — post-init WHO_AM_I re-check existed but was never invoked. Fix: called after sensors_init() succeeds; required sensor failure is fatal |
 | CRC_POLYNOMIAL comment "IBM CRC-24" wrong (packet_spec.h) | tx\, rx\, decoder\ packet_spec.h | 0x00065B is Nordic nRF proprietary CRC-24, not IBM CRC-24 (0x864CFB). Wrong label would cause independent CRC implementation to accept zero packets. Fix: corrected to "Nordic nRF proprietary radio CRC-24" |
 | timestamp comment "milliseconds, 65.5s" stale (packet_spec.h) | tx\, rx\, decoder\ packet_spec.h | RTC1 runs at 992.97Hz; field carries ticks not ms; wrap is ~66.0s not 65.5s. Fix: all three copies updated with ticks annotation and Phase 2 interpolation note |
@@ -447,6 +457,9 @@ Acceptable benchtop results:
 | Ctrl+C calls ExitProcess — no clean shutdown (decoder) | main.cpp | SerialReader destructor never ran; reader thread killed mid-operation; COM port not cleanly released. Fix: SetConsoleCtrlHandler sets g_running=false; main loop exits normally; destructor runs |
 | resync_events counter meaning undocumented (decoder) | main.cpp | Counter increments per byte advanced past, not per dropped packet. A single misalignment increments it many times; misleading in stats. Fix: label changed to resync_events with clarifying note in output |
 | RegQueryValueExA return value unchecked (decoder) | SerialReader.cpp | Failure silently left portName zero-initialised; device skipped without knowing why. Fix: check return value, continue on failure |
+| radio_init PREFIX0 not in readback (TX) | main.c (TX) | PREFIX0 mismatch causes same symptom as wrong CRCPOLY — silent dead link, no error on either side. BASE0 was verified but PREFIX0 was not. Fix: added to readback verification set in radio_init() |
+| fsr_read Phase 3 SAADC scan layout wrong (TX) | sensors.c (TX) | CH[0] (battery) configured by battery_init(); SAADC scans CH[0..4] in order. MAXCNT=4 captured CH[0..3]: adc_values[0] was battery (not FSR0), FSR3 (CH4) never sampled. Fix: MAXCNT=5, discard adc_values[0], read FSR0..FSR3 from adc_values[1..4] |
+| fsr_read Phase 3 SAADC timeout cleanup incomplete (TX) | sensors.c (TX) | STARTED timeout returned without issuing TASKS_STOP (SAADC left running); END timeout same; STOPPED timeout returned without clearing EVENTS_STOPPED (stale event causes subsequent saadc_stop_and_wait() to return immediately). Fix: all three paths stop cleanly; EVENTS_STOPPED cleared unconditionally |
 
 ---
 
@@ -692,7 +705,7 @@ Decoder is inside the repo — files are not copied, they are edited in place.
 project_reference.md lives at docs\ inside the repo.
 Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
 
-- **TX firmware is v3.9.** Any reference to v3.6 or earlier is obsolete.
+- **TX firmware is v3.11.** Any reference to v3.10 or earlier is obsolete.
 - **indicate_error_fatal() requires a forward declaration** at the top of main.c.
   It is called by timing_init() and the HFCLK startup block, both of which appear
   before its definition. Without the forward declaration, C99/C11 constraint violation.
@@ -717,6 +730,8 @@ Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
   Same two-pass senior review process applies before Phase 2 extended testing.
 - **TX v3.9 is the version to use.** main.c and sensors.c are in repo tx\ and SDK ses\.
 
+- **radio_init() readback covers: MODE, FREQUENCY, PCNF1.STATLEN, BASE0, PREFIX0, CRCPOLY, CRCINIT.** PREFIX0 was added in v3.10. A mismatch on any of these produces a silent dead link.
+- **Phase 3 fsr_read SAADC: MAXCNT=5, discard adc_values[0] (battery, CH0).** FSR0..FSR3 are in adc_values[1..4]. Do not revert to MAXCNT=4.
 - **On-air packet size: 86 bytes. USB frame: 89 bytes (sync + payload + checksum).**
 - **USB framing constants are in packet_spec.h.** USB_SYNC_BYTE_0 (0xAA), USB_SYNC_BYTE_1 (0x55), USB_FRAME_SIZE (89). Do not redefine locally in usb_serial.c, main.c (RX), or SerialReader.cpp.
 - **packet_spec.h must be identical in tx\ and rx\.** Run fc to verify before committing.
