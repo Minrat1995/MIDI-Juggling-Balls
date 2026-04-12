@@ -1,6 +1,6 @@
 # MIDI Juggling Balls — Project Reference
 
-**Version:** Post exhaustive TX code review (TX v3.12, RX v1.5, Decoder v1.6, full pipeline validated clean)
+**Version:** Post exhaustive TX code review (TX v3.14, RX v1.5, Decoder v1.6, full pipeline validated clean)
 **Goal:** Wireless juggling ball → sensor data → sound reinforcing visual performance
 **Repo:** https://github.com/Minrat1995/MIDI-Juggling-Balls (private)
 **Target:** <20ms perceived latency, <1% packet loss, scalable to 3+ balls
@@ -10,20 +10,23 @@
 ## CURRENT STATUS
 
 ### What is done
-- TX firmware v3.12: exhaustive multi-round code review complete. All identified issues
+- TX firmware v3.14: exhaustive multi-round code review complete. All identified issues
   resolved. Validated running on hardware (RTT confirmed, all sensors OK, pipeline clean).
   TX has run for 2+ hours without freeze on J-Link RTT — freeze issue may be resolved or
   intermittent; continue monitoring under extended conditions.
   Code considered production-ready pending watchdog addition and RX equivalent review.
-  Key fixes across v3.7–v3.12: CRCPOLY/CRCINIT/PREFIX0 readback added to radio_init;
+  Key fixes across v3.7–v3.14: CRCPOLY/CRCINIT/PREFIX0 readback added to radio_init;
   sensors_test() called at startup; get_timestamp_ms() renamed get_rtc_ticks();
   HFCLK/LFCLK startup timeouts (10ms/1000ms); saadc_stop_and_wait() helper for correct
-  SAADC sequencing; LSM6DSOX status bit symmetry; recover_radio() status reset;
+  SAADC sequencing; saadc_stop_and_wait() clears EVENTS_END (v3.14 — TASKS_STOP can
+  generate EVENTS_END per nRF52840 PS; stale event caused immediate-exit on next call);
+  LSM6DSOX status bit symmetry; recover_radio() status reset;
   forward declaration for indicate_error_fatal(); duplicate forward declaration removed;
   Phase 3 fsr_read SAADC scan layout corrected (MAXCNT=5, skip CH0 battery sample);
   Phase 3 fsr_read SAADC timeout error paths all leave clean peripheral state;
   raw byte assembly corrected at all sensor read sites — 12 sites in sensors_read()
-  (v3.11) plus sensors_read_temperature() and init_bmp581() (v3.12), all well-defined C99/C11.
+  (v3.11) plus sensors_read_temperature() and init_bmp581() (v3.12), all well-defined C99/C11;
+  temperature RTT display sign corrected for sub-zero fractions (v3.13).
 - RX firmware v1.5: end-to-end radio validated, ~1-2% RF packet loss benchtop. **Exhaustive
   code review not yet performed — queue for next session (same process as TX).**
 - USB framing: confirmed working end-to-end. 0 resyncs, decoder queue drops = 0
@@ -318,7 +321,7 @@ MIDI (discrete events, Phase 2):
 
 After flashing TX, connect J-Link and open RTT terminal. Expected startup:
 ```
-=== Juggling Ball TX (Ball 1) v3.11 ===
+=== Juggling Ball TX (Ball 1) v3.13 ===
 Packet sizes:
   radio_packet_t: 86 (expect 86)      <- must match
   sensor_data_t:  27 (expect 27)      <- must match
@@ -461,6 +464,8 @@ Acceptable benchtop results:
 | radio_init PREFIX0 not in readback (TX) | main.c (TX) | PREFIX0 mismatch causes same symptom as wrong CRCPOLY — silent dead link, no error on either side. BASE0 was verified but PREFIX0 was not. Fix: added to readback verification set in radio_init() |
 | fsr_read Phase 3 SAADC scan layout wrong (TX) | sensors.c (TX) | CH[0] (battery) configured by battery_init(); SAADC scans CH[0..4] in order. MAXCNT=4 captured CH[0..3]: adc_values[0] was battery (not FSR0), FSR3 (CH4) never sampled. Fix: MAXCNT=5, discard adc_values[0], read FSR0..FSR3 from adc_values[1..4] |
 | fsr_read Phase 3 SAADC timeout cleanup incomplete (TX) | sensors.c (TX) | STARTED timeout returned without issuing TASKS_STOP (SAADC left running); END timeout same; STOPPED timeout returned without clearing EVENTS_STOPPED (stale event causes subsequent saadc_stop_and_wait() to return immediately). Fix: all three paths stop cleanly; EVENTS_STOPPED cleared unconditionally |
+| Temperature RTT display sign lost for sub-zero fractions (TX) | main.c (TX) | `s.temperature/100` truncates toward zero; values in (−100..0) produce 0, silently dropping the minus sign. e.g. −0.50°C printed as "0.50 C". Fix: sign prefix printed separately using `s.temperature < 0 ? "-" : ""`; magnitude printed as `abs(s.temperature)/100` and `abs(s.temperature)%100`. Applies to both status log and emergency shutdown log. (v3.13) |
+| prepare_packet() comment claimed sequence set before blocking work (TX) | main.c (TX) | Comment said "sequence is set before any blocking work" — false; prepare_packet() runs after sensors_read() completes. Misleading for Phase 2 gap-fill implementation. Fix: corrected to "sequence is monotonically increasing and immune to I2C timing jitter". (v3.13) |
 
 ---
 
@@ -706,7 +711,7 @@ Decoder is inside the repo — files are not copied, they are edited in place.
 project_reference.md lives at docs\ inside the repo.
 Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
 
-- **TX firmware is v3.12.** Any reference to v3.11 or earlier is obsolete.
+- **TX firmware is v3.14.** Any reference to v3.13 or earlier is obsolete.
 - **indicate_error_fatal() requires a forward declaration** at the top of main.c.
   It is called by timing_init() and the HFCLK startup block, both of which appear
   before its definition. Without the forward declaration, C99/C11 constraint violation.
@@ -723,13 +728,15 @@ Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
   then git add tx\. See commit routine in FILE LOCATIONS AND COMMIT ROUTINE.
 - **get_timestamp_ms() is now get_rtc_ticks().** Any reference to get_timestamp_ms()
   is obsolete. The rename was made to eliminate persistent confusion in changelogs.
-- **saadc_stop_and_wait() is a shared helper.** Both the normal and timeout-exit paths
-  of read_battery_voltage() use it. Do not replace it with inline TASKS_STOP without
-  also waiting for EVENTS_STOPPED — the nRF52840 SAADC requires the stop to complete
-  before TASKS_START can be issued again.
+- **saadc_stop_and_wait() clears both EVENTS_STOPPED and EVENTS_END.** Both the normal
+  and timeout-exit paths of read_battery_voltage() use it. Do not replace it with inline
+  TASKS_STOP without also waiting for EVENTS_STOPPED — the nRF52840 SAADC requires the
+  stop to complete before TASKS_START can be issued again. EVENTS_END must also be cleared:
+  per nRF52840 PS, TASKS_STOP can generate EVENTS_END; a stale set event would cause the
+  EVENTS_END wait loop on the next call to exit immediately without a valid conversion.
 - **RX exhaustive code review is pending.** Do not assume RX code quality matches TX.
   Same two-pass senior review process applies before Phase 2 extended testing.
-- **TX v3.12 is the version to use.** main.c and sensors.c are in repo tx\ and SDK ses\.
+- **TX v3.14 is the version to use.** main.c and sensors.c are in repo tx\ and SDK ses\.
 
 - **radio_init() readback covers: MODE, FREQUENCY, PCNF1.STATLEN, BASE0, PREFIX0, CRCPOLY, CRCINIT.** PREFIX0 was added in v3.10. A mismatch on any of these produces a silent dead link.
 - **Phase 3 fsr_read SAADC: MAXCNT=5, discard adc_values[0] (battery, CH0).** FSR0..FSR3 are in adc_values[1..4]. Do not revert to MAXCNT=4.

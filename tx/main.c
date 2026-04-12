@@ -13,7 +13,19 @@
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
  *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
  *
- * @version 3.13
+ * @version 3.14
+ *
+ * Changelog from 3.13:
+ *   - saadc_stop_and_wait(): added NRF_SAADC->EVENTS_END = 0 after clearing
+ *     EVENTS_STOPPED. Per nRF52840 PS: "Stopping the SAADC may also generate
+ *     an EVENTS_END if no End event has been generated for the current value
+ *     of RESULT.MAXCNT." On an EVENTS_END timeout in read_battery_voltage(),
+ *     the peripheral is mid-conversion when TASKS_STOP is issued. If EVENTS_END
+ *     fires during stop, the stale event would cause the EVENTS_END wait loop
+ *     on the next call to exit immediately with no valid conversion, returning
+ *     whatever is in the adc buffer (typically 0 or stale data).
+ *     The same latent issue exists in the Phase 3 fsr_read() #if 0 block;
+ *     the fix carries over when that block is enabled.
  *
  * Changelog from 3.12:
  *   - transmit_status_packet(): temperature display corrected for sub-zero
@@ -311,12 +323,21 @@ static void battery_init(void)
 // Used by read_battery_voltage() both in the normal exit path and in all early
 // timeout returns. Without this wait, TASKS_START on the next call can race a
 // still-pending STOP, violating the nRF52840 SAADC sequencing requirement.
+//
+// EVENTS_END is also cleared here. Per nRF52840 PS: "Stopping the SAADC may
+// also generate an EVENTS_END if no End event has been generated for the current
+// value of RESULT.MAXCNT." If called after an EVENTS_END timeout in
+// read_battery_voltage(), the peripheral is mid-conversion; TASKS_STOP can
+// cause EVENTS_END to fire. Without clearing it here, the stale event would
+// cause the EVENTS_END wait loop on the very next call to exit immediately,
+// returning whatever is in the adc buffer without a valid conversion having run.
 static void saadc_stop_and_wait(void)
 {
     NRF_SAADC->TASKS_STOP = 1;
     uint32_t t = 100000;
     while (NRF_SAADC->EVENTS_STOPPED == 0 && t > 0) { t--; }
     NRF_SAADC->EVENTS_STOPPED = 0;
+    NRF_SAADC->EVENTS_END = 0;     // see comment above
 }
 
 static uint16_t read_battery_voltage(void)
@@ -671,7 +692,7 @@ int main(void)
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.13 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.14 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));
