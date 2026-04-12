@@ -13,7 +13,22 @@
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
  *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
  *
- * @version 3.12
+ * @version 3.13
+ *
+ * Changelog from 3.12:
+ *   - transmit_status_packet(): temperature display corrected for sub-zero
+ *     fractional values (e.g. -0.50 C). Previous form s.temperature/100 produces
+ *     0 for values in (-100..0), silently dropping the negative sign. Fixed by
+ *     printing sign prefix separately and using abs(s.temperature)/100 and
+ *     abs(s.temperature)%100. Applies to both the status log and the emergency
+ *     shutdown log.
+ *   - prepare_packet(): corrected comment on why sequence is preferred over
+ *     timestamp for gap-fill interpolation. Previous text said "sequence is set
+ *     before any blocking work" which is false — prepare_packet() runs after
+ *     sensors_read() completes. Correct reason: sequence is monotonically
+ *     increasing and immune to I2C timing jitter.
+ *   - TX_INTERVAL_MS: comment updated to note actual TX rate (~248Hz, not 250Hz).
+ *     4 RTC ticks at 992.97Hz = 4.028ms. No functional change.
  *
  * Changelog from 3.11 (sensors.c only, no main.c changes):
  *   - sensors_read_temperature(): uint32_t cast applied before shift in 24-bit
@@ -139,7 +154,7 @@ static void indicate_error_fatal(void);
 
 #define BALL_ID                 1           // Override via BLE provisioning (Phase 3)
 
-#define TX_INTERVAL_MS          4           // 250Hz
+#define TX_INTERVAL_MS          4           // 250Hz nominal (actual ~248Hz; 4 RTC ticks at 992.97Hz = 4.028ms)
 #define STATUS_INTERVAL_SEC     120         // Status packet every 2 minutes
 // RTC1 runs at 32768/(PRESCALER+1) = 32768/33 = 992.97 Hz.
 // STATUS_INTERVAL_TICKS avoids a 32-bit divide in the hot loop.
@@ -404,16 +419,18 @@ static void transmit_status_packet(void)
         if (battery_present && s.battery_voltage < BATTERY_SHUTDOWN_MV)
             SEGGER_RTT_printf(0, "EMERGENCY: Battery %u mV\r\n", s.battery_voltage);
         if (s.temperature >= TEMP_EMERGENCY_SHUTDOWN)
-            SEGGER_RTT_printf(0, "EMERGENCY: Temp %d.%02d C\r\n",
-                s.temperature / 100, abs(s.temperature % 100));
+            SEGGER_RTT_printf(0, "EMERGENCY: Temp %s%d.%02d C\r\n",
+                s.temperature < 0 ? "-" : "",
+                abs(s.temperature) / 100, abs(s.temperature) % 100);
         emergency_shutdown();
     }
 
     SEGGER_RTT_printf(0, "\r\n=== STATUS #%u ===\r\n", s.sequence);
     SEGGER_RTT_printf(0, "Battery: %u mV (%u%%)\r\n", s.battery_voltage, s.battery_percent);
     if (temp != SENSORS_TEMP_UNAVAILABLE) {
-        SEGGER_RTT_printf(0, "Temp:    %d.%02d C\r\n",
-            s.temperature / 100, abs(s.temperature % 100));
+        SEGGER_RTT_printf(0, "Temp:    %s%d.%02d C\r\n",
+            s.temperature < 0 ? "-" : "",
+            abs(s.temperature) / 100, abs(s.temperature) % 100);
     } else {
         SEGGER_RTT_printf(0, "Temp:    unavailable (BMP581 absent)\r\n");
     }
@@ -608,7 +625,8 @@ static void prepare_packet(void)
     // I2C reads take ~1ms; at 4ms TX interval the timestamp is ~25% stale
     // relative to the actual sensor sample time. For Phase 2 gap-fill
     // interpolation, use the sequence number rather than the timestamp field
-    // to determine packet position — sequence is set before any blocking work.
+    // to determine packet position — sequence is monotonically increasing and
+    // immune to the I2C timing jitter that affects the timestamp field.
     tx_packet.timestamp = get_rtc_ticks();
     memcpy(&tx_packet.data_t0, &sensor_history[0], sizeof(sensor_data_t));
     memcpy(&tx_packet.data_t1, &sensor_history[1], sizeof(sensor_data_t));
@@ -653,7 +671,7 @@ int main(void)
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.12 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.13 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));
