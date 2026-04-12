@@ -55,6 +55,16 @@
  *     to SENSOR_LSM6_OK using a local flag. Previously gyro success set the bit
  *     but accel success did not — achieving correct semantics only coincidentally.
  *     The explicit pattern makes the intent clear and removes the maintenance trap.
+ *
+ * Changelog from 3.11 (sensors.c only, no main.c changes):
+ *   - sensors_read_temperature(): uint32_t cast applied before shift in 24-bit
+ *     byte assembly. Previous form (t[1] << 8) and (t[2] << 16) are technically
+ *     safe on GCC/Cortex-M4 (int is 32-bit; shift never reaches sign bit) but are
+ *     the same C99/C11 non-conformant pattern fixed across sensors_read() in v3.11.
+ *     The v3.11 fix covered all 12 sites in sensors_read(); these two additional
+ *     sites were missed. Corrected form uses uint32_t casts throughout.
+ *   - init_bmp581() pressure validation read: same uint32_t cast fix applied.
+ *     Debug/validation code only, but the pattern should be consistent throughout.
  */
 
 #include "sensors.h"
@@ -514,9 +524,9 @@ static bool init_bmp581(void)
     uint8_t press_data[3];
     for (int attempt = 0; attempt < 5; attempt++) {
         if (i2c_read_regs(bmp_addr, BMP_PRESS_XLSB, press_data, 3)) {
-            uint32_t raw = press_data[0] |
-                          (press_data[1] << 8) |
-                          (press_data[2] << 16);
+            uint32_t raw = (uint32_t)press_data[0] |
+                          ((uint32_t)press_data[1] << 8) |
+                          ((uint32_t)press_data[2] << 16);
             uint32_t pa  = raw / 64;
             SEGGER_RTT_printf(0, "  [%d] raw=0x%06X = %u Pa\r\n", attempt + 1, raw, pa);
             if (raw != 0x7F7F7F && pa >= 30000 && pa <= 110000) {
@@ -874,7 +884,7 @@ int16_t sensors_read_temperature(void)
     if (!i2c_read_regs(bmp_addr, BMP_TEMP_XLSB, t, 3))
         return SENSORS_TEMP_UNAVAILABLE;
 
-    int32_t raw = (int32_t)(t[0] | (t[1] << 8) | (t[2] << 16));
+    int32_t raw = (int32_t)((uint32_t)t[0] | ((uint32_t)t[1] << 8) | ((uint32_t)t[2] << 16));
 
     // Sign-extend from bit 23 to 32 bits.
     // ~(int32_t)0x00FFFFFF is well-defined; (int32_t)0xFF000000 is not (exceeds

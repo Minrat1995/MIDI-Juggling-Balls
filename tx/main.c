@@ -13,9 +13,19 @@
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
  *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
  *
- * @version 3.11
+ * @version 3.12
  *
- * Changelog from 3.10:
+ * Changelog from 3.11 (sensors.c only, no main.c changes):
+ *   - sensors_read_temperature(): uint32_t cast applied before shift in 24-bit
+ *     byte assembly. Previous form was the same C99/C11 non-conformant pattern
+ *     fixed across sensors_read() in v3.11 ("all 12 sites"). Those 12 sites were
+ *     all in sensors_read(); sensors_read_temperature() and init_bmp581() were
+ *     additional sites that were missed. No behaviour change on GCC/Cortex-M4
+ *     (int is 32-bit; the maximum shift value 0xFF<<16 is within positive int range),
+ *     but the pattern is now consistent throughout the file.
+ *   - init_bmp581() pressure validation read: same uint32_t cast fix applied.
+ *
+ * Changelog from 3.11:
  *   - sensors.c: raw byte assembly corrected at all 12 sites (gyro×3, accel×3,
  *     mag×3, H3LIS×3). See sensors.c changelog for full explanation. No
  *     behaviour change on GCC/Cortex-M4; removes C99/C11 non-conformance.
@@ -643,7 +653,7 @@ int main(void)
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.11 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.12 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));

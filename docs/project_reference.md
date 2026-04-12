@@ -1,6 +1,6 @@
 # MIDI Juggling Balls — Project Reference
 
-**Version:** Post exhaustive TX code review (TX v3.11, RX v1.5, Decoder v1.6, full pipeline validated clean)
+**Version:** Post exhaustive TX code review (TX v3.12, RX v1.5, Decoder v1.6, full pipeline validated clean)
 **Goal:** Wireless juggling ball → sensor data → sound reinforcing visual performance
 **Repo:** https://github.com/Minrat1995/MIDI-Juggling-Balls (private)
 **Target:** <20ms perceived latency, <1% packet loss, scalable to 3+ balls
@@ -10,19 +10,20 @@
 ## CURRENT STATUS
 
 ### What is done
-- TX firmware v3.11: exhaustive multi-round code review complete. All identified issues
+- TX firmware v3.12: exhaustive multi-round code review complete. All identified issues
   resolved. Validated running on hardware (RTT confirmed, all sensors OK, pipeline clean).
   TX has run for 2+ hours without freeze on J-Link RTT — freeze issue may be resolved or
   intermittent; continue monitoring under extended conditions.
   Code considered production-ready pending watchdog addition and RX equivalent review.
-  Key fixes across v3.7–v3.11: CRCPOLY/CRCINIT/PREFIX0 readback added to radio_init;
+  Key fixes across v3.7–v3.12: CRCPOLY/CRCINIT/PREFIX0 readback added to radio_init;
   sensors_test() called at startup; get_timestamp_ms() renamed get_rtc_ticks();
   HFCLK/LFCLK startup timeouts (10ms/1000ms); saadc_stop_and_wait() helper for correct
   SAADC sequencing; LSM6DSOX status bit symmetry; recover_radio() status reset;
   forward declaration for indicate_error_fatal(); duplicate forward declaration removed;
   Phase 3 fsr_read SAADC scan layout corrected (MAXCNT=5, skip CH0 battery sample);
   Phase 3 fsr_read SAADC timeout error paths all leave clean peripheral state;
-  raw byte assembly corrected at all 12 sensor read sites (well-defined C99/C11).
+  raw byte assembly corrected at all sensor read sites — 12 sites in sensors_read()
+  (v3.11) plus sensors_read_temperature() and init_bmp581() (v3.12), all well-defined C99/C11.
 - RX firmware v1.5: end-to-end radio validated, ~1-2% RF packet loss benchtop. **Exhaustive
   code review not yet performed — queue for next session (same process as TX).**
 - USB framing: confirmed working end-to-end. 0 resyncs, decoder queue drops = 0
@@ -705,7 +706,7 @@ Decoder is inside the repo — files are not copied, they are edited in place.
 project_reference.md lives at docs\ inside the repo.
 Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
 
-- **TX firmware is v3.11.** Any reference to v3.10 or earlier is obsolete.
+- **TX firmware is v3.12.** Any reference to v3.11 or earlier is obsolete.
 - **indicate_error_fatal() requires a forward declaration** at the top of main.c.
   It is called by timing_init() and the HFCLK startup block, both of which appear
   before its definition. Without the forward declaration, C99/C11 constraint violation.
@@ -728,7 +729,7 @@ Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
   before TASKS_START can be issued again.
 - **RX exhaustive code review is pending.** Do not assume RX code quality matches TX.
   Same two-pass senior review process applies before Phase 2 extended testing.
-- **TX v3.9 is the version to use.** main.c and sensors.c are in repo tx\ and SDK ses\.
+- **TX v3.12 is the version to use.** main.c and sensors.c are in repo tx\ and SDK ses\.
 
 - **radio_init() readback covers: MODE, FREQUENCY, PCNF1.STATLEN, BASE0, PREFIX0, CRCPOLY, CRCINIT.** PREFIX0 was added in v3.10. A mismatch on any of these produces a silent dead link.
 - **Phase 3 fsr_read SAADC: MAXCNT=5, discard adc_values[0] (battery, CH0).** FSR0..FSR3 are in adc_values[1..4]. Do not revert to MAXCNT=4.
