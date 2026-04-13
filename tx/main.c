@@ -13,9 +13,24 @@
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
  *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
  *
- * @version 3.14
+ * @version 3.15
  *
- * Changelog from 3.13:
+ * Changelog from 3.14:
+ *   - TX_INTERVAL_MS renamed to TX_INTERVAL_TICKS. The constant holds a tick
+ *     count and is used exclusively in tick arithmetic (added to get_rtc_ticks()
+ *     output, passed to nrf_delay_ms() where 1 tick ≈ 1.007ms). The _MS suffix
+ *     re-introduced the exact class of confusion the v3.6 rename campaign
+ *     (current_time_ms -> current_ticks, get_timestamp_ms -> get_rtc_ticks) was
+ *     meant to eliminate. No functional change.
+ *   - Timing wrap arithmetic: (int32_t)((int16_t)(next_tx_time - current_ticks))
+ *     corrected to (int32_t)(int16_t)(uint16_t)(next_tx_time - current_ticks) at
+ *     both sites (debug diff and timing control). Both operands are uint16_t;
+ *     integer promotion produces a 32-bit int before subtraction, so values
+ *     outside [-32768, 32767] cast directly to int16_t are implementation-defined
+ *     in C99/C11. The intermediate uint16_t cast keeps subtraction in the unsigned
+ *     domain before the sign-reinterpretation. Same class of fix as the 12-site
+ *     correction in sensors.c (v3.11). No behaviour change on GCC/Cortex-M4.
+ *
  *   - saadc_stop_and_wait(): added NRF_SAADC->EVENTS_END = 0 after clearing
  *     EVENTS_STOPPED. Per nRF52840 PS: "Stopping the SAADC may also generate
  *     an EVENTS_END if no End event has been generated for the current value
@@ -166,7 +181,7 @@ static void indicate_error_fatal(void);
 
 #define BALL_ID                 1           // Override via BLE provisioning (Phase 3)
 
-#define TX_INTERVAL_MS          4           // 250Hz nominal (actual ~248Hz; 4 RTC ticks at 992.97Hz = 4.028ms)
+#define TX_INTERVAL_TICKS       4           // 250Hz nominal (actual ~248Hz; 4 RTC ticks at 992.97Hz = 4.028ms)
 #define STATUS_INTERVAL_SEC     120         // Status packet every 2 minutes
 // RTC1 runs at 32768/(PRESCALER+1) = 32768/33 = 992.97 Hz.
 // STATUS_INTERVAL_TICKS avoids a 32-bit divide in the hot loop.
@@ -692,7 +707,7 @@ int main(void)
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.14 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.15 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));
@@ -751,7 +766,7 @@ int main(void)
     SEGGER_RTT_printf(0, "Transmitting at 250Hz (4ms). Status every %us.\r\n\r\n",
         STATUS_INTERVAL_SEC);
 
-    next_tx_time = get_rtc_ticks() + TX_INTERVAL_MS;
+    next_tx_time = get_rtc_ticks() + TX_INTERVAL_TICKS;
 
     while (1)
     {
@@ -759,7 +774,7 @@ int main(void)
 
         // Debug timing: print once per second (250 loops at 250Hz)
         if (loop_count % 250 == 0) {
-            int32_t diff = (int32_t)((int16_t)(next_tx_time - current_ticks));
+            int32_t diff = (int32_t)(int16_t)(uint16_t)(next_tx_time - current_ticks);
             SEGGER_RTT_printf(0, "DEBUG: loop=%u T=%u next=%u diff=%d\r\n",
                 loop_count, current_ticks, next_tx_time, diff);
         }
@@ -835,9 +850,9 @@ int main(void)
         // Precision timing.
         // next_tx_time and current_ticks are both uint16_t so subtraction
         // wraps correctly at the 65535-tick boundary (~66.0s at 993Hz).
-        next_tx_time += TX_INTERVAL_MS;
+        next_tx_time += TX_INTERVAL_TICKS;
         current_ticks = get_rtc_ticks();
-        int32_t time_diff = (int32_t)((int16_t)(next_tx_time - current_ticks));
+        int32_t time_diff = (int32_t)(int16_t)(uint16_t)(next_tx_time - current_ticks);
 
         if (time_diff > 0 && time_diff < 100) {
             nrf_delay_ms((uint32_t)time_diff);
@@ -845,7 +860,7 @@ int main(void)
             // Resync on large deviation. Large negative: loop stalled (e.g. slow
             // I2C on first BMP read). Large positive: startup artifact or glitch.
             SEGGER_RTT_printf(0, "WARN: timing resync (diff=%d)\r\n", time_diff);
-            next_tx_time = current_ticks + TX_INTERVAL_MS;
+            next_tx_time = current_ticks + TX_INTERVAL_TICKS;
         }
         // time_diff 0..-100: slightly behind, transmit immediately next iteration
     }
