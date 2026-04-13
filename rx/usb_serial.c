@@ -16,8 +16,7 @@
  * after finding the sync header and extracting the payload, the checksum
  * is recomputed and compared. A mismatch means the sync header was a
  * false positive (0xAA 0x55 appearing in payload data), and the decoder
- * discards the frame and resyncs. This eliminates the ~20% false-sync
- * loss rate caused by 0xAA 0x55 collisions in sensor data.
+ * discards the frame and resyncs.
  *
  * Phase 1 limitation: USB cable must be connected at boot.
  * Hot-plug (connecting USB after power-on) is not supported in this version.
@@ -65,30 +64,36 @@ APP_USBD_CDC_ACM_GLOBAL_DEF(m_app_cdc_acm,
 static volatile bool usb_configured = false;
 static volatile bool port_open      = false;
 
-// TX frame buffer and state.
+// TX frame buffer for framed packet writes (USB_FRAME_SIZE = 89 bytes).
 //
 // app_usbd_cdc_acm_write() is non-blocking: it starts a USB DMA transfer and
 // returns immediately. The DMA hardware continues reading from the buffer
 // pointer asynchronously, potentially across two USB bulk packets (64 bytes,
 // then the remainder). If the buffer is a local stack variable, the function
 // returns and the stack is reused while the DMA for the second packet is still
-// in flight, causing garbage to be transmitted.
+// in flight, causing garbage to be transmitted for the last 25 bytes.
 //
-// Fix: keep the frame buffer as a module-level static. The DMA always reads
-// from live memory.
+// Fix: keep the frame buffer as a module-level static so DMA always reads
+// live memory regardless of when the second bulk packet fires.
+static uint8_t s_tx_frame[USB_FRAME_SIZE];
+
+// TX text buffer for send_text() writes.
 //
-// Secondary concern: if usb_serial_send_framed_packet() is called again before
-// the DMA from the previous call completes, the static buffer would be
-// overwritten mid-transfer. This is prevented by s_tx_busy: the TX_DONE
-// callback clears it, and send_framed_packet drops the incoming packet if it
-// is still set. At 250Hz (4ms period) with DMA completing in ~1ms this guard
-// is almost never triggered in normal operation. When it is, the dropped
-// packet is indistinguishable from RF packet loss at the decoder.
-//
-// The same s_tx_busy guard applies to usb_serial_send_text(). Both functions
-// share the DMA path and must not overlap.
-static uint8_t          s_tx_frame[USB_FRAME_SIZE];
-static volatile bool    s_tx_busy = false;
+// Same DMA concern applies: if the caller passes a stack string, and the
+// string is longer than one USB full-speed bulk packet (64 bytes), the second
+// packet would read freed stack. Fix: copy into this static buffer first.
+// Capped at 255 characters; longer strings are truncated silently.
+#define TX_TEXT_MAX  256
+static char s_tx_text[TX_TEXT_MAX];
+
+// Guards both TX paths. Set before app_usbd_cdc_acm_write(); cleared by
+// TX_DONE callback. Both paths share the same USB data endpoint; overlapping
+// writes corrupt the ongoing DMA transfer.
+static volatile bool s_tx_busy = false;
+
+// Drop counter: incremented whenever send_framed_packet() cannot send.
+// Reset on PORT_OPEN so pre-connection startup drops don't pollute stats.
+static volatile uint32_t s_tx_drop_count = 0;
 
 // ============================================================================
 // CDC ACM EVENT HANDLER
@@ -97,10 +102,13 @@ static volatile bool    s_tx_busy = false;
 static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst,
                                     app_usbd_cdc_acm_user_event_t event)
 {
+    (void)p_inst;   // parameter mandated by SDK callback signature; not used here
     switch (event) {
         case APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN:
-            port_open  = true;
-            s_tx_busy  = false;  // clear any stale pending state on reconnect
+            port_open      = true;
+            s_tx_busy      = false;   // clear any stale pending state on reconnect
+            s_tx_drop_count = 0;      // reset drop counter — pre-connection drops
+                                      // are expected and not meaningful
             SEGGER_RTT_printf(0, "USB: port opened by host\r\n");
             break;
         case APP_USBD_CDC_ACM_USER_EVT_PORT_CLOSE:
@@ -249,17 +257,21 @@ bool usb_serial_ready(void)
     return (usb_configured && port_open);
 }
 
-bool usb_serial_send_framed_packet(const radio_packet_t *packet,
-                                   uint8_t sync0,
-                                   uint8_t sync1)
+bool usb_serial_send_framed_packet(const radio_packet_t *packet)
 {
-    if (!usb_serial_ready()) return false;
+    if (!usb_serial_ready()) {
+        s_tx_drop_count++;
+        return false;
+    }
 
     // Guard: drop if the previous DMA transfer is still in flight.
     // s_tx_busy is set here and cleared in TX_DONE. At 250Hz this guard is
     // almost never triggered (DMA completes in ~1ms, period is 4ms), but it
     // prevents buffer corruption in the event of a timing anomaly.
-    if (s_tx_busy) return false;
+    if (s_tx_busy) {
+        s_tx_drop_count++;
+        return false;
+    }
 
     // Build the frame into the module-level static buffer.
     //
@@ -271,12 +283,12 @@ bool usb_serial_send_framed_packet(const radio_packet_t *packet,
     // by the time the second DMA fires, so the last 25 bytes are garbage.
     //
     // Frame layout (USB_FRAME_SIZE = 89 bytes):
-    //   [0]         sync0 (USB_SYNC_BYTE_0 = 0xAA)
-    //   [1]         sync1 (USB_SYNC_BYTE_1 = 0x55)
-    //   [2-87]      radio_packet_t payload (86 bytes)
-    //   [88]        XOR checksum of bytes [2-87]
-    s_tx_frame[0] = sync0;
-    s_tx_frame[1] = sync1;
+    //   [0]    USB_SYNC_BYTE_0 (0xAA)
+    //   [1]    USB_SYNC_BYTE_1 (0x55)
+    //   [2-87] radio_packet_t payload (86 bytes)
+    //   [88]   XOR checksum of bytes [2-87]
+    s_tx_frame[0] = USB_SYNC_BYTE_0;
+    s_tx_frame[1] = USB_SYNC_BYTE_1;
     memcpy(&s_tx_frame[2], packet, sizeof(radio_packet_t));
 
     const uint8_t *bytes = (const uint8_t *)packet;
@@ -290,6 +302,7 @@ bool usb_serial_send_framed_packet(const radio_packet_t *packet,
     ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, s_tx_frame, USB_FRAME_SIZE);
     if (ret != NRF_SUCCESS) {
         s_tx_busy = false;
+        s_tx_drop_count++;
         return false;
     }
     return true;
@@ -304,11 +317,35 @@ bool usb_serial_send_text(const char *text)
     // the ongoing transfer. s_tx_busy is cleared by TX_DONE.
     if (s_tx_busy) return false;
 
+    // Copy into static buffer before writing.
+    //
+    // app_usbd_cdc_acm_write() is non-blocking and starts DMA. For strings
+    // longer than one USB full-speed bulk packet (64 bytes), the second DMA
+    // fires after this function returns. If the caller passed a stack pointer,
+    // the stack has been reused by then — the last bytes would be garbage.
+    // Copying here ensures DMA always reads from live static memory.
+    // Strings longer than TX_TEXT_MAX-1 bytes are silently truncated.
+    strncpy(s_tx_text, text, TX_TEXT_MAX - 1);
+    s_tx_text[TX_TEXT_MAX - 1] = '\0';
+    size_t len = strlen(s_tx_text);
+
     s_tx_busy = true;
-    ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, text, strlen(text));
+    ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, (const uint8_t *)s_tx_text, len);
     if (ret != NRF_SUCCESS) {
         s_tx_busy = false;
         return false;
     }
     return true;
+}
+
+uint32_t usb_serial_get_and_reset_tx_drop_count(void)
+{
+    // Brief IRQ disable for atomic read-and-clear.
+    // s_tx_drop_count can be incremented from the main loop context only
+    // (both send functions are called from main), so the window is minimal.
+    __disable_irq();
+    uint32_t n = s_tx_drop_count;
+    s_tx_drop_count = 0;
+    __enable_irq();
+    return n;
 }

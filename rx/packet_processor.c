@@ -16,14 +16,25 @@
  */
 
 #include "packet_processor.h"
-#include "radio_rx.h"
 #include <string.h>
+#include <stdbool.h>
 
 extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 
 // ============================================================================
 // INTERNAL STATE
 // ============================================================================
+
+// ball_state_t is internal to this module. It was previously in packet_processor.h
+// when a public getter existed. The getter was removed as dead code; the type
+// stays here until a public API for it is deliberately re-introduced.
+typedef struct {
+    uint16_t last_sequence;
+    uint32_t packets_received;
+    uint32_t packets_lost;
+    uint32_t rx_timestamp_ticks;    // RTC ticks at last received packet (~993Hz, not ms)
+    bool     initialized;
+} ball_state_t;
 
 static ball_state_t ball_state[MAX_BALLS];
 
@@ -61,7 +72,7 @@ static void decode_sensor_data(const sensor_data_t *d, decoded_sensors_t *out)
     out->h3lis[2] = extract_h3lis_axis(d->h3lis_z_flags);
 
     // FSR: 4 LSBs of the packed H3LIS fields
-    out->fsr_intensity = (uint8_t)(d->h3lis_x_fsr_level  & 0x0F);
+    out->fsr_intensity = (uint8_t)(d->h3lis_x_fsr_level   & 0x0F);
     out->fsr_pattern   = (uint8_t)(d->h3lis_y_fsr_pattern & 0x0F);
 
     // Pressure: 24-bit little-endian raw value, Pa = raw / 64
@@ -81,26 +92,28 @@ void packet_processor_init(void)
     memset(last_decoded, 0, sizeof(last_decoded));
 }
 
-void packet_processor_process(const radio_packet_t *packet, uint32_t rx_time_ms)
+void packet_processor_process(const radio_packet_t *packet, uint32_t rx_ticks)
 {
     uint8_t id = packet->ball_id;
     if (id == 0 || id > MAX_BALLS) {
-        SEGGER_RTT_printf(0, "RX: invalid ball_id %d\r\n", id);
+        SEGGER_RTT_printf(0, "RX: invalid ball_id %u\r\n", id);
         return;
     }
 
     ball_state_t *s = &ball_state[id - 1];
 
-    // Decode t0 (current sample) for RTT display
+    // Decode t0 (current sample) for RTT display.
+    // t1 and t2 (redundant samples) are transmitted but not used on RX side
+    // in Phase 1. Phase 2 gap-fill interpolation will use them.
     decode_sensor_data(&packet->data_t0, &last_decoded[id - 1]);
 
     if (!s->initialized) {
-        s->last_sequence    = packet->sequence;
-        s->packets_received = 1;
-        s->packets_lost     = 0;
-        s->rx_timestamp_ms  = rx_time_ms;
-        s->initialized      = true;
-        SEGGER_RTT_printf(0, "\r\n*** Ball %d: first packet seq=%u ***\r\n",
+        s->last_sequence       = packet->sequence;
+        s->packets_received    = 1;
+        s->packets_lost        = 0;
+        s->rx_timestamp_ticks  = rx_ticks;
+        s->initialized         = true;
+        SEGGER_RTT_printf(0, "\r\n*** Ball %u: first packet seq=%u ***\r\n",
             id, packet->sequence);
         return;
     }
@@ -121,26 +134,32 @@ void packet_processor_process(const radio_packet_t *packet, uint32_t rx_time_ms)
 
     if (gap > 0 && gap < 500) {
         s->packets_lost += gap;
-        SEGGER_RTT_printf(0, "Ball %d: %u packet(s) lost before seq %u\r\n",
+        SEGGER_RTT_printf(0, "Ball %u: %u packet(s) lost before seq %u\r\n",
             id, gap, received);
     } else if (gap >= 500) {
-        SEGGER_RTT_printf(0, "Ball %d: large gap %u at seq %u — TX restart?\r\n",
+        SEGGER_RTT_printf(0, "Ball %u: large gap %u at seq %u — TX restart?\r\n",
             id, gap, received);
     }
 
-    s->last_sequence    = received;
+    s->last_sequence       = received;
     s->packets_received++;
-    s->rx_timestamp_ms  = rx_time_ms;
+    s->rx_timestamp_ticks  = rx_ticks;
 }
 
 void packet_processor_print_statistics(void)
 {
+    // CAUTION: If RTT up-buffer is full and RTT is in blocking mode, this
+    // function stalls. The radio ISR fires every 4ms during the stall and
+    // overwrites the single RX buffer — isr_overwrites will increment.
+    // Set SEGGER_RTT_CONFIG_DEFAULT_MODE = SEGGER_RTT_MODE_NO_BLOCK_SKIP
+    // to drop RTT output lines rather than dropping radio packets.
+
     radio_stats_t rs;
     radio_get_stats(&rs);
 
     SEGGER_RTT_printf(0, "\r\n--- RX Stats ---\r\n");
-    SEGGER_RTT_printf(0, "Radio: %lu OK  %lu CRC-fail  %lu END events\r\n",
-        rs.total_packets, rs.crc_errors, rs.end_events);
+    SEGGER_RTT_printf(0, "Radio: %lu OK  %lu CRC-fail  %lu END events  %lu ISR-overwrites\r\n",
+        rs.total_packets, rs.crc_errors, rs.end_events, rs.isr_overwrites);
 
     bool any_ball = false;
     for (int i = 0; i < MAX_BALLS; i++) {
@@ -183,13 +202,4 @@ void packet_processor_print_statistics(void)
         SEGGER_RTT_printf(0, "No balls seen yet\r\n");
     }
     SEGGER_RTT_printf(0, "\r\n");
-}
-
-bool packet_processor_get_ball_state(uint8_t ball_id, ball_state_t *state)
-{
-    if (ball_id == 0 || ball_id > MAX_BALLS || !state) return false;
-    ball_state_t *s = &ball_state[ball_id - 1];
-    if (!s->initialized) return false;
-    memcpy(state, s, sizeof(ball_state_t));
-    return true;
 }

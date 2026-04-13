@@ -5,7 +5,6 @@
 #include "radio_rx.h"
 #include "nrf.h"
 #include "nrf_delay.h"
-#include <string.h>
 
 extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 
@@ -16,14 +15,16 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 // Single receive buffer.
 // The ISR writes here; main loop copies it out within the 4ms window (250Hz).
 // If the main loop is delayed longer than 4ms the buffer will be overwritten.
-// For Phase 1 with one ball this is not expected. Phase 3 multi-ball requires
-// a ring buffer before running 250Hz x 3 balls simultaneously.
+// isr_overwrites tracks this — a non-zero count means packets were silently
+// lost due to main loop latency, not RF loss. See radio_stats_t.
+// Phase 3 multi-ball requires a ring buffer before running 250Hz x 3 balls.
 static radio_packet_t rx_packet;
 static volatile bool  packet_received = false;
 
-static volatile uint32_t total_packets = 0;
-static volatile uint32_t crc_errors    = 0;
-static volatile uint32_t end_events    = 0;
+static volatile uint32_t total_packets  = 0;
+static volatile uint32_t crc_errors     = 0;
+static volatile uint32_t end_events     = 0;
+static volatile uint32_t isr_overwrites = 0;
 
 // ============================================================================
 // PUBLIC FUNCTIONS
@@ -78,21 +79,27 @@ bool radio_init(void)
     NVIC_EnableIRQ(RADIO_IRQn);
 
     // Verify critical configuration was written correctly.
-    // Checks registers with non-trivial values: a bus fault or unclocked peripheral
-    // will produce wrong readbacks rather than matching what we wrote.
+    // Checks registers with non-trivial values: a bus fault or unclocked
+    // peripheral will produce wrong readbacks rather than matching what was
+    // written. CRCPOLY and CRCINIT are included because a mismatch causes
+    // 100% packet loss that looks identical to RF dead air.
     bool mode_ok    = (NRF_RADIO->MODE ==
                         (RADIO_MODE_MODE_Nrf_2Mbit << RADIO_MODE_MODE_Pos));
     bool freq_ok    = (NRF_RADIO->FREQUENCY == RF_CHANNEL);
     bool payload_ok = (((NRF_RADIO->PCNF1 >> RADIO_PCNF1_STATLEN_Pos) & 0xFF)
                         == PACKET_PAYLOAD_SIZE);
     bool addr_ok    = (NRF_RADIO->BASE0 == RADIO_BASE_ADDR);
+    bool crcpoly_ok = (NRF_RADIO->CRCPOLY == CRC_POLYNOMIAL);
+    bool crcinit_ok = (NRF_RADIO->CRCINIT == CRC_INIT_VALUE);
 
     if (!mode_ok)    SEGGER_RTT_printf(0, "RADIO: MODE readback mismatch\r\n");
     if (!freq_ok)    SEGGER_RTT_printf(0, "RADIO: FREQUENCY readback mismatch\r\n");
     if (!payload_ok) SEGGER_RTT_printf(0, "RADIO: PCNF1 STATLEN readback mismatch\r\n");
     if (!addr_ok)    SEGGER_RTT_printf(0, "RADIO: BASE0 readback mismatch\r\n");
+    if (!crcpoly_ok) SEGGER_RTT_printf(0, "RADIO: CRCPOLY readback mismatch\r\n");
+    if (!crcinit_ok) SEGGER_RTT_printf(0, "RADIO: CRCINIT readback mismatch\r\n");
 
-    return (mode_ok && freq_ok && payload_ok && addr_ok);
+    return (mode_ok && freq_ok && payload_ok && addr_ok && crcpoly_ok && crcinit_ok);
 }
 
 void radio_start_rx(void)
@@ -121,12 +128,13 @@ void radio_clear_packet_flag(void)
 void radio_get_stats(radio_stats_t *stats)
 {
     if (!stats) return;
-    // Snapshot all three counters atomically to prevent observing a partially
-    // updated state. IRQs disabled for ~6 instructions — negligible impact.
+    // Snapshot all four counters atomically to prevent observing a partially
+    // updated state. IRQs disabled for ~8 instructions — negligible impact.
     __disable_irq();
-    stats->total_packets = total_packets;
-    stats->crc_errors    = crc_errors;
-    stats->end_events    = end_events;
+    stats->total_packets  = total_packets;
+    stats->crc_errors     = crc_errors;
+    stats->end_events     = end_events;
+    stats->isr_overwrites = isr_overwrites;
     __enable_irq();
 }
 
@@ -141,7 +149,15 @@ void RADIO_IRQHandler(void)
         end_events++;
 
         if (NRF_RADIO->CRCSTATUS == 1) {
-            // CRC OK — new valid packet in rx_packet buffer
+            // CRC OK — new valid packet in rx_packet buffer.
+            // If the main loop has not yet consumed the previous packet,
+            // it will be silently overwritten. Count this so it is visible
+            // in the stats block. A non-zero count means the main loop is
+            // blocking for > 4ms — most likely cause is RTT output stalling
+            // on a full RTT up-buffer (check SEGGER_RTT_CONFIG_DEFAULT_MODE).
+            if (packet_received) {
+                isr_overwrites++;
+            }
             packet_received = true;
             total_packets++;
         } else {

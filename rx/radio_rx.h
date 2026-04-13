@@ -22,6 +22,12 @@ typedef struct {
     uint32_t total_packets;     // Packets received with CRC OK
     uint32_t crc_errors;        // CRC failures
     uint32_t end_events;        // Total RADIO END interrupts (good + bad)
+    uint32_t isr_overwrites;    // CRC-OK packets dropped because the previous
+                                // packet had not yet been consumed by the main
+                                // loop. Indicates main loop is taking > 4ms
+                                // between radio_packet_available() checks.
+                                // Non-zero is a real loss event — investigate
+                                // what is blocking the main loop (RTT, USB).
 } radio_stats_t;
 
 // ============================================================================
@@ -31,6 +37,9 @@ typedef struct {
 /**
  * Initialize radio for 2Mbps GFSK reception.
  * Must be called before radio_start_rx().
+ *
+ * Verifies MODE, FREQUENCY, PCNF1.STATLEN, BASE0, CRCPOLY, and CRCINIT
+ * readbacks. A mismatch means the peripheral did not accept the configuration.
  *
  * @return true on success
  */
@@ -71,6 +80,7 @@ void radio_clear_packet_flag(void);
 
 /**
  * Fill stats structure with current reception counters.
+ * Snapshot is taken with IRQs disabled for atomicity.
  */
 void radio_get_stats(radio_stats_t *stats);
 
