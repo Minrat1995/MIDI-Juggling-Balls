@@ -56,6 +56,20 @@
  *     but accel success did not — achieving correct semantics only coincidentally.
  *     The explicit pattern makes the intent clear and removes the maintenance trap.
  *
+ * Changelog post v3.18 (sensors.c only, no main.c changes):
+ *   - init_bmp581(): OSR_CONFIG and ODR_CONFIG readback values now compared
+ *     against expected values; return false on mismatch. Previously the readbacks
+ *     were printed but not validated, creating a discrepancy with the BUGS FIXED
+ *     table in project_reference.md which recorded this as resolved. Step 7
+ *     pressure validation remains as an implicit backstop but the explicit
+ *     register-level check is now present.
+ *   - sensors_read(): H3LIS FSR field packing corrected. (int16_t)0xFFF0 is an
+ *     implementation-defined cast — the integer constant 0xFFF0 (65520) exceeds
+ *     INT16_MAX (32767), so narrowing to int16_t is implementation-defined in
+ *     C99/C11. Fixed using unsigned domain arithmetic identical to the 12-site
+ *     pattern documented in the v3.11 changelog. Three packing lines affected
+ *     (h3lis_x_fsr_level, h3lis_y_fsr_pattern, h3lis_z_flags).
+ *
  * Changelog from 3.11 (sensors.c only, no main.c changes):
  *   - sensors_read_temperature(): uint32_t cast applied before shift in 24-bit
  *     byte assembly. Previous form (t[1] << 8) and (t[2] << 16) are technically
@@ -335,6 +349,13 @@ static bool fsr_read(uint16_t *fsr_out)
         uint32_t t2 = 100000;
         while (NRF_SAADC->EVENTS_STOPPED == 0 && t2 > 0) { t2--; }
         NRF_SAADC->EVENTS_STOPPED = 0;
+        // TASKS_STOP can generate EVENTS_END per nRF52840 PS. Stale event would
+        // cause the EVENTS_END wait in read_battery_voltage() to exit immediately.
+        NRF_SAADC->EVENTS_END = 0;
+        // Hardware may have generated EVENTS_STARTED during/after TASKS_STOP on
+        // an anomalous-timing path. Stale event would cause next EVENTS_STARTED
+        // wait to exit before the SAADC has actually started.
+        NRF_SAADC->EVENTS_STARTED = 0;
         NRF_SAADC->RESOLUTION = saved_res;
         memset(fsr_out, 0, 4 * sizeof(uint16_t));
         return false;
@@ -350,6 +371,9 @@ static bool fsr_read(uint16_t *fsr_out)
         uint32_t t2 = 100000;
         while (NRF_SAADC->EVENTS_STOPPED == 0 && t2 > 0) { t2--; }
         NRF_SAADC->EVENTS_STOPPED = 0;
+        // TASKS_STOP can generate EVENTS_END per nRF52840 PS. Stale event would
+        // cause the EVENTS_END wait in read_battery_voltage() to exit immediately.
+        NRF_SAADC->EVENTS_END = 0;
         NRF_SAADC->RESOLUTION = saved_res;
         memset(fsr_out, 0, 4 * sizeof(uint16_t));
         return false;
@@ -492,18 +516,28 @@ static bool init_bmp581(void)
     if (!i2c_write_reg(bmp_addr, BMP_OSR_CONFIG, BMP_OSR_CONFIG_VAL)) {
         SEGGER_RTT_printf(0, "  FAILED\r\n"); return false;
     }
-    if (i2c_read_reg(bmp_addr, BMP_OSR_CONFIG, &reg_val))
+    if (i2c_read_reg(bmp_addr, BMP_OSR_CONFIG, &reg_val)) {
         SEGGER_RTT_printf(0, "  OSR_CONFIG readback=0x%02X (expect 0x%02X)\r\n",
             reg_val, BMP_OSR_CONFIG_VAL);
+        if (reg_val != BMP_OSR_CONFIG_VAL) {
+            SEGGER_RTT_printf(0, "  FAILED: OSR_CONFIG readback mismatch (PRESS_EN may not be set)\r\n");
+            return false;
+        }
+    }
     nrf_delay_ms(10);
 
     SEGGER_RTT_printf(0, "Step 5: NORMAL mode (~218Hz)...\r\n");
     if (!i2c_write_reg(bmp_addr, BMP_ODR_CONFIG, BMP_ODR_CONFIG_VAL)) {
         SEGGER_RTT_printf(0, "  FAILED\r\n"); return false;
     }
-    if (i2c_read_reg(bmp_addr, BMP_ODR_CONFIG, &reg_val))
+    if (i2c_read_reg(bmp_addr, BMP_ODR_CONFIG, &reg_val)) {
         SEGGER_RTT_printf(0, "  ODR_CONFIG readback=0x%02X (expect 0x%02X)\r\n",
             reg_val, BMP_ODR_CONFIG_VAL);
+        if (reg_val != BMP_ODR_CONFIG_VAL) {
+            SEGGER_RTT_printf(0, "  FAILED: ODR_CONFIG readback mismatch\r\n");
+            return false;
+        }
+    }
     nrf_delay_ms(100);
 
     SEGGER_RTT_printf(0, "Step 6: Waiting for data ready...\r\n");
@@ -800,12 +834,15 @@ void sensors_read(sensor_data_t *data)
             if (fsr_raw[2] > FSR_CONTACT_THRESHOLD) fsr_pattern |= 0x04;
             if (fsr_raw[3] > FSR_CONTACT_THRESHOLD) fsr_pattern |= 0x08;
 
-            // Explicit mask before OR: do not rely on sensor hardware guaranteeing
-            // zeros in bits [3:0]. The mask makes the packing intention explicit.
-            data->h3lis_x_fsr_level   = (h3lis_raw[0] & (int16_t)0xFFF0) | (int16_t)fsr_intensity;
-            data->h3lis_y_fsr_pattern = (h3lis_raw[1] & (int16_t)0xFFF0) | (int16_t)fsr_pattern;
+            // Unsigned domain arithmetic: (int16_t)0xFFF0 would be an implementation-defined
+            // cast (65520 > INT16_MAX). Cast h3lis_raw to uint16_t first so the AND is in the
+            // unsigned domain; cast the result back to int16_t (well-defined two's complement
+            // truncation on any conforming implementation). Same pattern as the 12-site fix
+            // documented in the v3.11 changelog.
+            data->h3lis_x_fsr_level   = (int16_t)(((uint16_t)h3lis_raw[0] & 0xFFF0U) | ((uint16_t)fsr_intensity & 0x0FU));
+            data->h3lis_y_fsr_pattern = (int16_t)(((uint16_t)h3lis_raw[1] & 0xFFF0U) | ((uint16_t)fsr_pattern  & 0x0FU));
             // Lower 4 bits of z-axis field are reserved; mask clears them.
-            data->h3lis_z_flags       = h3lis_raw[2] & (int16_t)0xFFF0;
+            data->h3lis_z_flags       = (int16_t) ((uint16_t)h3lis_raw[2] & 0xFFF0U);
             runtime_sensor_status |= SENSOR_H3LIS_OK;
         } else {
             data->h3lis_x_fsr_level   = 0;

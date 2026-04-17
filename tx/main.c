@@ -13,7 +13,65 @@
  *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
  *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
  *
- * @version 3.15
+ * @version 3.18
+ *
+ * Changelog from 3.17:
+ *   - wdt_init() moved to after the 500ms LED flash. Previously wdt_init() ran
+ *     before the flash, and nrf_delay_ms(500) with SLEEP=Run counts against the
+ *     WDT timeout. WDT_TIMEOUT_MS is 500ms, so the WDT fired during the flash
+ *     before the main loop could call wdt_feed() even once, causing an infinite
+ *     WDT reset loop. The LED flash is cosmetic; it does not need watchdog
+ *     protection. Moving wdt_init() to after the flash means the first feed
+ *     fires within one loop iteration (~4ms), well within the 500ms window.
+ *
+ * Changelog from 3.16:
+ *   - wdt_init(): Hardware watchdog added. Configured with 500ms timeout,
+ *     run during sleep (SLEEP=Run), pause during debugger halt (HALT=Pause).
+ *     HALT=Pause prevents spurious resets during J-Link debug sessions; it has
+ *     no effect in production where J-Link is not attached.
+ *     wdt_feed() is called once per main loop iteration. If the loop stalls —
+ *     most likely cause: nrf_drv_twi blocking indefinitely on a TWI peripheral
+ *     hang (nRF52840 Errata 89/121 affecting nrf_drv_twi in blocking mode) —
+ *     the WDT fires after 500ms and resets TX autonomously. RX will log a large
+ *     sequence gap and resume without any manual intervention.
+ *     WDT_TIMEOUT_MS = 500. At 250Hz nominal loop rate this gives ~125 iterations
+ *     of margin. Any value in the 200-2000ms range is suitable; 500ms sits well
+ *     above the worst-case I2C transaction time (~5ms for all four sensors) while
+ *     minimising freeze duration in production use.
+ *     The WDT cannot be stopped once started. It is initialised after all other
+ *     peripherals so that a hang during init does not trigger a reset loop before
+ *     the fault can be diagnosed.
+ *
+ *   - Reset reason logged at startup (NRF_POWER->RESETREAS). A WDT reset
+ *     (RESETREAS.DOG set) logs "RESET REASON: WDT" to RTT, confirming the
+ *     stall occurred and that autonomous recovery fired. Power-on and reset-pin
+ *     causes are also distinguished. RESETREAS is cleared immediately after
+ *     reading; without this, the reason persists across soft resets and
+ *     mis-attributes subsequent resets.
+ *
+ * Changelog from 3.15:
+ *   - read_battery_voltage(): EVENTS_STARTED now cleared on STARTED timeout return
+ *     path, after saadc_stop_and_wait(). Previously saadc_stop_and_wait() ran
+ *     (clearing EVENTS_STOPPED and EVENTS_END) but EVENTS_STARTED was left
+ *     uncleaned. On an anomalous-timing STARTED timeout the hardware may generate
+ *     EVENTS_STARTED during or after TASKS_STOP. That stale event would cause the
+ *     EVENTS_STARTED wait loop on the very next call to exit immediately, firing
+ *     TASKS_SAMPLE before the SAADC has actually started and returning garbage.
+ *     Fix is in the fault path only; no behaviour change on normal operation.
+ *
+ *   - sensors.c fsr_read() #if 0 Phase 3 block: same class of fix at two sites:
+ *     (a) STARTED timeout inline stop path: EVENTS_END and EVENTS_STARTED now
+ *         cleared after EVENTS_STOPPED = 0. TASKS_STOP can generate EVENTS_END
+ *         per nRF52840 PS — same rationale as saadc_stop_and_wait(). EVENTS_STARTED
+ *         may be set by the hardware on an anomalous STARTED timeout for the same
+ *         reason as above.
+ *     (b) END timeout inline stop path: EVENTS_END now cleared after
+ *         EVENTS_STOPPED = 0. TASKS_STOP can generate EVENTS_END; the stale event
+ *         would cause the EVENTS_END wait in the subsequent read_battery_voltage()
+ *         call to exit immediately without a valid conversion.
+ *     Both sites are in dead code (#if 0); fixes are required before Phase 3
+ *     enablement. The EVENTS_STOPPED-after-timeout clear already present at both
+ *     sites was correct and unchanged.
  *
  * Changelog from 3.14:
  *   - TX_INTERVAL_MS renamed to TX_INTERVAL_TICKS. The constant holds a tick
@@ -217,6 +275,14 @@ static void indicate_error_fatal(void);
 #define HFCLK_STARTUP_TIMEOUT_MS    10      // 10ms: HFXO
 #define LFCLK_STARTUP_TIMEOUT_MS    1000    // 1000ms: LFXO (200-600ms typical)
 
+// Watchdog timeout.
+// The WDT is fed once per main loop iteration (~4ms at 250Hz). 500ms gives
+// ~125 loop iterations of margin — well above any legitimate single-loop
+// stall (worst-case I2C: ~5ms for all four sensors; status packet: ~5ms of
+// RTT + battery + temp reads). Any stall longer than 500ms is pathological
+// and warrants a reset. The nRF52840 WDT cannot be stopped once started.
+#define WDT_TIMEOUT_MS          500         // 500ms: ~125 loop iterations at 250Hz
+
 // ============================================================================
 // RADIO STATE
 // ============================================================================
@@ -256,8 +322,9 @@ static uint32_t last_status_rtc_tick = 0;
 //     The counter wraps at ~65535 ticks = ~66.0s. For timing arithmetic, always
 //     use uint16_t subtraction so wrapping is well-defined.
 //   - get_uptime_seconds() divides by RTC1_TICKS_PER_SEC (993), giving <0.003%
-//     error. The previous value of 1000 caused 0.71% fast readout (~12.8s
-//     ahead after 30 minutes).
+//     error. The previous value of 1000 caused 0.71% slow readout (~12.8s
+//     behind after 30 minutes): RTC runs at 992.97Hz, so 1800 real seconds
+//     accumulate 1,787,346 ticks; 1,787,346/1000 = 1787s shown vs 1800s actual.
 //   - Packet timestamp field carries these ticks. For Phase 2 t1/t2 gap-fill
 //     interpolation, treat as ticks (not milliseconds). Each tick = ~1.007ms.
 // ============================================================================
@@ -290,7 +357,7 @@ static void timing_init(void)
         SEGGER_RTT_printf(0, "LFCLK already running (started by TWI driver)\r\n");
     }
 
-    NRF_RTC1->PRESCALER = 32;   // 992.97 Hz (~1ms), 0.71% slow — see note above
+    NRF_RTC1->PRESCALER = 32;   // 992.97 Hz (~1ms) — see RTC1_TICKS_PER_SEC note above
     NRF_RTC1->TASKS_START = 1;
     // Allow the counter to advance past 0 before get_rtc_ticks() is first called.
     // Without this, a very fast loop iteration after timing_init() could read
@@ -312,6 +379,61 @@ static inline uint16_t get_rtc_ticks(void)
 static uint32_t get_uptime_seconds(void)
 {
     return (uint32_t)(NRF_RTC1->COUNTER / RTC1_TICKS_PER_SEC);
+}
+
+// ============================================================================
+// WATCHDOG  (nRF52840 WDT peripheral)
+//
+// The WDT provides autonomous recovery from any main loop stall. The primary
+// known stall cause is nrf_drv_twi blocking indefinitely on a TWI peripheral
+// hang (nRF52840 Errata 89/121). If sensors_read() never returns, the main
+// loop stops feeding the WDT, and the WDT resets TX after WDT_TIMEOUT_MS.
+//
+// Configuration choices:
+//   SLEEP=Run:   required — the main loop calls nrf_delay_ms() which may
+//                put the CPU to sleep. Without this the WDT would pause
+//                during normal timing delays and never fire.
+//   HALT=Pause:  the WDT pauses when the CPU is halted by a debugger. This
+//                prevents spurious resets during J-Link debug sessions. In
+//                production (no J-Link) HALT has no effect.
+//
+// The WDT cannot be stopped once started. It is initialised last in the
+// startup sequence so that a hang during init (e.g. sensor detection) does
+// not trigger a reset loop before RTT can log the cause.
+//
+// After a WDT reset, RESETREAS.DOG is set. The startup banner reads
+// RESETREAS and logs the cause, making WDT resets immediately visible on RTT.
+// ============================================================================
+
+static void wdt_init(void)
+{
+    // CRV = (timeout_ms * 32768 / 1000) - 1
+    // At 500ms: (500 * 32768 / 1000) - 1 = 16383
+    NRF_WDT->CRV = (WDT_TIMEOUT_MS * 32768UL / 1000UL) - 1UL;
+
+    NRF_WDT->CONFIG =
+        (WDT_CONFIG_SLEEP_Run   << WDT_CONFIG_SLEEP_Pos) |  // run during nrf_delay_ms sleep
+        (WDT_CONFIG_HALT_Pause  << WDT_CONFIG_HALT_Pos);    // pause when J-Link halts CPU
+
+    // Enable reload register 0. Only RR[0] is used; writing RR[0] feeds the WDT.
+    NRF_WDT->RREN = WDT_RREN_RR0_Enabled << WDT_RREN_RR0_Pos;
+
+    // Start. Cannot be stopped after this point.
+    NRF_WDT->TASKS_START = 1;
+
+    // Feed immediately so the first timeout window starts from now, not from
+    // when TASKS_START was issued.
+    NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+
+    SEGGER_RTT_printf(0, "WDT started (timeout %ums)\r\n", WDT_TIMEOUT_MS);
+}
+
+// Feed the watchdog. Must be called at least once per WDT_TIMEOUT_MS.
+// Called at the top of the main loop — any stall within a single loop
+// iteration that exceeds WDT_TIMEOUT_MS triggers a reset.
+static inline void wdt_feed(void)
+{
+    NRF_WDT->RR[0] = WDT_RR_RR_Reload;
 }
 
 // ============================================================================
@@ -365,7 +487,15 @@ static uint16_t read_battery_voltage(void)
     NRF_SAADC->TASKS_START = 1;
     timeout = 100000;
     while (NRF_SAADC->EVENTS_STARTED == 0 && timeout > 0) { timeout--; }
-    if (timeout == 0) { saadc_stop_and_wait(); return 0; }
+    if (timeout == 0) {
+        saadc_stop_and_wait();
+        // Clear EVENTS_STARTED: hardware may have generated it during or after
+        // TASKS_STOP on an anomalous-timing path. A stale event would cause the
+        // EVENTS_STARTED wait loop on the next call to exit immediately, firing
+        // TASKS_SAMPLE before the SAADC has actually started.
+        NRF_SAADC->EVENTS_STARTED = 0;
+        return 0;
+    }
     NRF_SAADC->EVENTS_STARTED = 0;
 
     NRF_SAADC->TASKS_SAMPLE = 1;
@@ -706,8 +836,43 @@ int main(void)
     NRF_P1->DIRSET = (1 << LED_PIN);
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
+    // Read and clear reset reason. Must happen early, before any operation that
+    // could itself reset the device (e.g. indicate_error_fatal). Cleared by
+    // writing 1 to each set bit — without clearing, the reason persists across
+    // soft resets and mis-attributes subsequent resets.
+    //
+    // RESETREAS bits (nRF52840 PS):
+    //   Bit 0  RESETPIN : reset via reset pin
+    //   Bit 1  DOG      : reset via watchdog (WDT)
+    //   Bit 2  SREQ     : reset via NVIC_SystemReset()
+    //   Bit 3  LOCKUP   : reset via CPU lockup
+    //   Bit 16 OFF      : wakeup from System OFF
+    //   Bit 17 LPCOMP   : wakeup from LPCOMP
+    //   Bit 18 DIF      : wakeup from debug interface
+    //   Bit 19 NFC      : wakeup from NFC field
+    //
+    // RESETREAS = 0 after a power-on reset (all bits cleared by the power-on
+    // reset itself). Any non-zero value indicates a subsequent reset type.
+    {
+        uint32_t rr = NRF_POWER->RESETREAS;
+        NRF_POWER->RESETREAS = rr;  // write 1s to clear
+        if (rr == 0) {
+            SEGGER_RTT_printf(0, "RESET REASON: power-on\r\n");
+        } else if (rr & POWER_RESETREAS_DOG_Msk) {
+            SEGGER_RTT_printf(0, "RESET REASON: WDT (watchdog) — loop stall detected\r\n");
+        } else if (rr & POWER_RESETREAS_SREQ_Msk) {
+            SEGGER_RTT_printf(0, "RESET REASON: soft reset (NVIC_SystemReset)\r\n");
+        } else if (rr & POWER_RESETREAS_RESETPIN_Msk) {
+            SEGGER_RTT_printf(0, "RESET REASON: reset pin\r\n");
+        } else if (rr & POWER_RESETREAS_LOCKUP_Msk) {
+            SEGGER_RTT_printf(0, "RESET REASON: CPU lockup\r\n");
+        } else {
+            SEGGER_RTT_printf(0, "RESET REASON: 0x%08lX\r\n", rr);
+        }
+    }
+
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.15 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.18 ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));
@@ -763,6 +928,14 @@ int main(void)
     NRF_P1->OUTSET = (1 << LED_PIN); nrf_delay_ms(500);
     NRF_P1->OUTCLR = (1 << LED_PIN);
 
+    // Watchdog — started after the LED flash. The flash is nrf_delay_ms(500),
+    // which equals WDT_TIMEOUT_MS. With SLEEP=Run the WDT counts through
+    // nrf_delay_ms(); starting before the flash would fire the WDT before the
+    // main loop ever runs. The flash is cosmetic and does not need watchdog
+    // protection. Starting here means the first wdt_feed() fires within one
+    // loop iteration (~4ms). Once started, the WDT cannot be stopped.
+    wdt_init();
+
     SEGGER_RTT_printf(0, "Transmitting at 250Hz (4ms). Status every %us.\r\n\r\n",
         STATUS_INTERVAL_SEC);
 
@@ -770,6 +943,11 @@ int main(void)
 
     while (1)
     {
+        // Feed the watchdog at the top of every loop iteration.
+        // If sensors_read() (or any other blocking call below) hangs for longer
+        // than WDT_TIMEOUT_MS without returning here, the WDT fires and resets TX.
+        wdt_feed();
+
         current_ticks = get_rtc_ticks();
 
         // Debug timing: print once per second (250 loops at 250Hz)

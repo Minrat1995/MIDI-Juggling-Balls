@@ -7,7 +7,8 @@
  *
  * Sensor configuration:
  *   LSM6DSOX: 416Hz ODR, ±16g accel, ±500dps gyro, BDU enabled
- *   LIS3MDL:  155Hz ODR (FAST_ODR enabled), ±4 gauss, continuous mode, BDU enabled
+ *   LIS3MDL:  155Hz ODR (FAST_ODR enabled), ±4 gauss, continuous mode
+ *             (BDU not enabled — CTRL_REG5 not written; burst reads via | 0x80 mitigate split-read risk)
  *   H3LIS331: 400Hz ODR, ±400g, BDU enabled
  *   BMP581:   ~218Hz ODR, OSR x4, normal mode, on-chip compensation
  *   FSR:      4 channels on SAADC Ch1-4, disabled until Phase 3 wiring
