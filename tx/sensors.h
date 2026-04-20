@@ -59,10 +59,12 @@
 
 /**
  * Initialize I2C bus and all sensors.
- * LSM6DSOX and LIS3MDL are required — returns false if either is absent.
+ * LSM6DSOX and LIS3MDL are required — returns false if either is not detected
+ * or if any config write fails for either sensor.
  * H3LIS331 and BMP581 are optional — warnings printed but init continues.
  *
- * @return true on success, false if LSM6 or LIS3 fails
+ * @return true on success, false on TWI init failure or if LSM6 or LIS3 is
+ *         not detected or fails configuration
  */
 bool sensors_init(void);
 
@@ -82,7 +84,11 @@ void sensors_read(sensor_data_t *data);
 /**
  * Verify sensor communication (WHO_AM_I checks).
  *
- * @return true if LSM6 and LIS3 respond correctly
+ * Returns true if all required sensors (LSM6DSOX, LIS3MDL) pass WHO_AM_I
+ * re-read AND all optional sensors that were detected at init time also pass.
+ * An optional sensor not detected at init (addr == 0) is excluded from the check.
+ *
+ * @return true if all detected sensors respond with correct WHO_AM_I values
  */
 bool sensors_test(void);
 

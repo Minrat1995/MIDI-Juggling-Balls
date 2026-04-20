@@ -2,7 +2,7 @@
  * Juggling Ball Wireless Transmitter
  *
  * 250Hz, 86-byte packets over 2.4GHz custom protocol.
- * Status packets every 2 minutes via RTT (battery, temp, health).
+ * Status data logged to RTT every 2 minutes (battery, temp, health).
  *
  * Hardware: Adafruit Feather nRF52840
  * Sensors:  LSM6DSOX + LIS3MDL + H3LIS331 + BMP581 + 4xFSR (Phase 3)
@@ -10,10 +10,36 @@
  * Sensor ODR vs TX rate at 250Hz:
  *   LSM6DSOX accel/gyro: 416Hz  - 1.66x TX rate, near-full capture
  *   H3LIS331:            400Hz  - 1.6x TX rate, near-full capture
- *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (BDU safe)
- *   LIS3MDL:             155Hz  - TX 1.6x faster, ~every 2nd packet has fresh mag data
+ *   BMP581:              ~218Hz - TX slightly faster, occasional duplicate read (harmless; normal mode registers update atomically)
+ *   LIS3MDL:             155Hz  - TX 1.6x faster, ~3 in 5 packets have fresh mag data
  *
- * @version 3.18
+ * @version 3.18 + post-v3.18 fixes
+ *
+ * Post-v3.18 functional fix (main.c):
+ *   - emergency_shutdown(): wdt_feed() added inside blink loop. The blinks run
+ *     for 2000ms; WDT timeout is 500ms with SLEEP=Run (counts through
+ *     nrf_delay_ms). Without feeding, the WDT fires at ~blink 3 and resets the
+ *     device before NRF_POWER->SYSTEMOFF = 1 is reached, making battery/thermal
+ *     emergency shutdown permanently ineffective. Feeding the WDT during
+ *     intentional diagnostic work is appropriate — the WDT exists to catch
+ *     unintentional stalls, not deliberate sequences.
+ *
+ * Post-v3.18 comment fixes (no functional changes):
+ *   - LIS3MDL freshness fraction corrected: "~every 2nd packet" -> "~3 in 5 packets"
+ *   - transmit_status_packet() renamed log_status_rtt() (function never transmitted
+ *     over radio or USB; name implied wire transmission that does not occur)
+ *   - WDT SLEEP=Run block comment corrected: cites TWI/WFI stall (Errata 89/121)
+ *     as the reason SLEEP=Run is required, not nrf_delay_ms
+ *   - WDT SLEEP=Run inline comment in wdt_init(): same correction applied
+ *     (was "run during nrf_delay_ms sleep"; now "count during WFI")
+ *   - "Status packet(s)" language in three live comments corrected to "Status data
+ *     logged to RTT": file header line, STATUS_INTERVAL_SEC definition, and main
+ *     loop comment above log_status_rtt() call. All three described the function
+ *     as transmitting a packet, inconsistent with the log_status_rtt() rename.
+ *   - BMP581 ODR comment: "(BDU safe)" replaced with "(harmless; normal mode
+ *     registers update atomically)". BDU (Block Data Update) is an ST-sensor
+ *     hardware feature present on LSM6DSOX, LIS3MDL, and H3LIS331. The BMP581
+ *     is a Bosch part with no BDU mechanism; applying the term was inaccurate.
  *
  * Changelog from 3.17:
  *   - wdt_init() moved to after the 500ms LED flash. Previously wdt_init() ran
@@ -101,7 +127,7 @@
  *     the fix carries over when that block is enabled.
  *
  * Changelog from 3.12:
- *   - transmit_status_packet(): temperature display corrected for sub-zero
+ *   - log_status_rtt(): temperature display corrected for sub-zero
  *     fractional values (e.g. -0.50 C). Previous form s.temperature/100 produces
  *     0 for values in (-100..0), silently dropping the negative sign. Fixed by
  *     printing sign prefix separately and using abs(s.temperature)/100 and
@@ -118,7 +144,7 @@
  * Changelog from 3.11 (sensors.c only, no main.c changes):
  *   - sensors_read_temperature(): uint32_t cast applied before shift in 24-bit
  *     byte assembly. Previous form was the same C99/C11 non-conformant pattern
- *     fixed across sensors_read() in v3.11 ("all 12 sites"). Those 12 sites were
+ *     fixed across sensors_read() in v3.11 (\"all 12 sites\"). Those 12 sites were
  *     all in sensors_read(); sensors_read_temperature() and init_bmp581() were
  *     additional sites that were missed. No behaviour change on GCC/Cortex-M4
  *     (int is 32-bit; the maximum shift value 0xFF<<16 is within positive int range),
@@ -170,6 +196,7 @@
  *     The loop covers sizeof-1 bytes, implicitly requiring checksum to be the last
  *     field. The _Static_assert guards size, not order; a field inserted after
  *     checksum without updating the loop would silently cover the wrong bytes.
+ *     Any structural change to status_packet_t must be verified here.
  *
  * Changelog from 3.6:
  *   - radio_init(): CRCPOLY and CRCINIT added to readback verification. These were
@@ -240,7 +267,7 @@ static void indicate_error_fatal(void);
 #define BALL_ID                 1           // Override via BLE provisioning (Phase 3)
 
 #define TX_INTERVAL_TICKS       4           // 250Hz nominal (actual ~248Hz; 4 RTC ticks at 992.97Hz = 4.028ms)
-#define STATUS_INTERVAL_SEC     120         // Status packet every 2 minutes
+#define STATUS_INTERVAL_SEC     120         // Status data logged to RTT every 2 minutes
 // RTC1 runs at 32768/(PRESCALER+1) = 32768/33 = 992.97 Hz.
 // STATUS_INTERVAL_TICKS avoids a 32-bit divide in the hot loop.
 #define STATUS_INTERVAL_TICKS   ((STATUS_INTERVAL_SEC * 32768U) / 33U)  // ~119156
@@ -250,7 +277,7 @@ static void indicate_error_fatal(void);
 #define BATTERY_USB_THRESHOLD   1000        // Below 1V = USB-only, no battery
 #define BATTERY_FULL_MV         4200
 // BATTERY_EMPTY_MV and BATTERY_SHUTDOWN_MV are intentionally the same value.
-// The shutdown test in transmit_status_packet() is strict less-than (<3300mV),
+// The shutdown test in log_status_rtt() is strict less-than (<3300mV),
 // so exactly 3300mV does not trigger shutdown. estimate_battery_percent()
 // returns 0 for <=3300mV. Do not adjust one constant independently of the
 // other — changing either moves the zero-percent / shutdown boundary.
@@ -278,7 +305,7 @@ static void indicate_error_fatal(void);
 // Watchdog timeout.
 // The WDT is fed once per main loop iteration (~4ms at 250Hz). 500ms gives
 // ~125 loop iterations of margin — well above any legitimate single-loop
-// stall (worst-case I2C: ~5ms for all four sensors; status packet: ~5ms of
+// stall (worst-case I2C: ~5ms for all four sensors; status log: ~5ms of
 // RTT + battery + temp reads). Any stall longer than 500ms is pathological
 // and warrants a reset. The nRF52840 WDT cannot be stopped once started.
 #define WDT_TIMEOUT_MS          500         // 500ms: ~125 loop iterations at 250Hz
@@ -307,9 +334,9 @@ static volatile radio_state_t radio_status = RADIO_STATE_OK;
 static uint32_t tx_timeout_count = 0;
 static uint32_t total_packets_sent = 0;
 
-// last_status_rtc_tick: RTC COUNTER value at the last status packet transmission.
+// last_status_rtc_tick: RTC COUNTER value at the last log_status_rtt() call.
 // Stored at file scope (not as static local in main) so it is visible alongside
-// other module state. Zero-initialised; the first status packet fires at boot + 2min.
+// other module state. Zero-initialised; the first status log fires at boot + 2min.
 static uint32_t last_status_rtc_tick = 0;
 
 // ============================================================================
@@ -374,7 +401,7 @@ static inline uint16_t get_rtc_ticks(void)
 }
 
 // Uptime in seconds. Divides by RTC1_TICKS_PER_SEC (993) for <0.003% error.
-// 24-bit counter overflows at ~4.7 hours; produces one spurious status packet
+// 24-bit counter overflows at ~4.7 hours; triggers one spurious log_status_rtt()
 // at that point — acceptable for a performance context.
 static uint32_t get_uptime_seconds(void)
 {
@@ -390,9 +417,12 @@ static uint32_t get_uptime_seconds(void)
 // loop stops feeding the WDT, and the WDT resets TX after WDT_TIMEOUT_MS.
 //
 // Configuration choices:
-//   SLEEP=Run:   required — the main loop calls nrf_delay_ms() which may
-//                put the CPU to sleep. Without this the WDT would pause
-//                during normal timing delays and never fire.
+//   SLEEP=Run:   required — the primary stall scenario (Errata 89/121 TWI
+//                peripheral hang) leaves nrf_drv_twi blocking with the CPU
+//                in WFI indefinitely. With SLEEP=Pause the WDT does not
+//                count during WFI and would never fire during that hang.
+//                SLEEP=Run causes the WDT to count regardless of CPU sleep
+//                state.
 //   HALT=Pause:  the WDT pauses when the CPU is halted by a debugger. This
 //                prevents spurious resets during J-Link debug sessions. In
 //                production (no J-Link) HALT has no effect.
@@ -412,7 +442,7 @@ static void wdt_init(void)
     NRF_WDT->CRV = (WDT_TIMEOUT_MS * 32768UL / 1000UL) - 1UL;
 
     NRF_WDT->CONFIG =
-        (WDT_CONFIG_SLEEP_Run   << WDT_CONFIG_SLEEP_Pos) |  // run during nrf_delay_ms sleep
+        (WDT_CONFIG_SLEEP_Run   << WDT_CONFIG_SLEEP_Pos) |  // count during WFI (required for TWI/Errata 89/121 stall detection)
         (WDT_CONFIG_HALT_Pause  << WDT_CONFIG_HALT_Pos);    // pause when J-Link halts CPU
 
     // Enable reload register 0. Only RR[0] is used; writing RR[0] feeds the WDT.
@@ -538,7 +568,12 @@ static uint8_t calculate_checksum(const status_packet_t *p)
 static void emergency_shutdown(void)
 {
     SEGGER_RTT_printf(0, "\r\n!!! EMERGENCY SHUTDOWN !!!\r\n");
+    // Feed WDT during the blink sequence. The blinks take 2000ms; WDT timeout
+    // is 500ms with SLEEP=Run. Without feeding here, the WDT fires at ~blink 3
+    // and resets the device before SYSTEMOFF is reached, defeating the shutdown.
+    // Feeding during intentional work (not a stuck loop) is appropriate.
     for (int i = 0; i < 10; i++) {
+        wdt_feed();
         NRF_P1->OUTSET = (1 << LED_PIN); nrf_delay_ms(100);
         NRF_P1->OUTCLR = (1 << LED_PIN); nrf_delay_ms(100);
     }
@@ -548,7 +583,7 @@ static void emergency_shutdown(void)
     while (1);
 }
 
-static void transmit_status_packet(void)
+static void log_status_rtt(void)
 {
     status_packet_t s;
     s.ball_id     = BALL_ID;
@@ -570,10 +605,16 @@ static void transmit_status_packet(void)
     s.sensor_health      = sensors_get_status_bitmask();
     s.total_packets_sent = total_packets_sent;
     s.uptime_seconds     = get_uptime_seconds();
-    // tx_timeout_count is uint32_t; radio_timeouts is uint16_t in the wire format.
-    // The narrowing is intentional — the field cannot change without breaking the
-    // on-air packet format. At 250Hz, uint16_t saturates after ~262 seconds of
-    // consecutive radio failures, which is well past the TX freeze detection point.
+    // tx_timeout_count is uint32_t; radio_timeouts is uint16_t in status_packet_t.
+    // The narrowing is intentional — the struct has a fixed layout (_Static_assert
+    // in packet_spec.h) and the checksum covers all preceding bytes by index; any
+    // field width change would also require updating the checksum calculation.
+    // NOTE: the cast wraps (not saturates) at 65535. After 65535 consecutive
+    // radio failures (~262 seconds at 250Hz) the counter rolls to 0 and the
+    // status log would show 0 timeouts. In practice the WDT fires well before
+    // a continuous 500ms stall reaches that scale, so wrapping is not a concern
+    // in normal operation. The full uint32_t count remains in tx_timeout_count
+    // for any future diagnostic use.
     s.radio_timeouts     = (uint16_t)tx_timeout_count;
     s.i2c_errors         = sensors_get_i2c_error_count();
     s.reserved           = 0;
@@ -872,7 +913,7 @@ int main(void)
     }
 
     // Startup banner
-    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.18 ===\r\n", BALL_ID);
+    SEGGER_RTT_printf(0, "\r\n=== Juggling Ball TX (Ball %d) v3.18+fixes ===\r\n", BALL_ID);
     SEGGER_RTT_printf(0, "Packet sizes:\r\n");
     SEGGER_RTT_printf(0, "  radio_packet_t: %u (expect 86)\r\n",     sizeof(radio_packet_t));
     SEGGER_RTT_printf(0, "  sensor_data_t:  %u (expect 27)\r\n",     sizeof(sensor_data_t));
@@ -1007,11 +1048,11 @@ int main(void)
             recover_radio();
         }
 
-        // Status packet every STATUS_INTERVAL_SEC seconds.
+        // Status data logged to RTT every STATUS_INTERVAL_SEC seconds.
         // Subtraction masked to 24 bits handles the RTC counter wrap at 0xFFFFFF.
         if (((NRF_RTC1->COUNTER - last_status_rtc_tick) & 0xFFFFFFU)
                 >= STATUS_INTERVAL_TICKS) {
-            transmit_status_packet();
+            log_status_rtt();
             last_status_rtc_tick = NRF_RTC1->COUNTER;
         }
 

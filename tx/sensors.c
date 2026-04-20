@@ -56,19 +56,37 @@
  *     but accel success did not — achieving correct semantics only coincidentally.
  *     The explicit pattern makes the intent clear and removes the maintenance trap.
  *
- * Changelog post v3.18 (sensors.c only, no main.c changes):
- *   - init_bmp581(): OSR_CONFIG and ODR_CONFIG readback values now compared
- *     against expected values; return false on mismatch. Previously the readbacks
- *     were printed but not validated, creating a discrepancy with the BUGS FIXED
- *     table in project_reference.md which recorded this as resolved. Step 7
- *     pressure validation remains as an implicit backstop but the explicit
- *     register-level check is now present.
- *   - sensors_read(): H3LIS FSR field packing corrected. (int16_t)0xFFF0 is an
- *     implementation-defined cast — the integer constant 0xFFF0 (65520) exceeds
- *     INT16_MAX (32767), so narrowing to int16_t is implementation-defined in
- *     C99/C11. Fixed using unsigned domain arithmetic identical to the 12-site
- *     pattern documented in the v3.11 changelog. Three packing lines affected
- *     (h3lis_x_fsr_level, h3lis_y_fsr_pattern, h3lis_z_flags).
+ * Post-v3.18 fixes (sensors.c):
+ *   - fsr_read() #if 0 Phase 3 block, STOPPED timeout path: EVENTS_END = 0 added
+ *     after EVENTS_STOPPED = 0. TASKS_STOP can generate EVENTS_END per nRF52840 PS
+ *     (same as saadc_stop_and_wait() rationale). The v3.15 fix covered the STARTED
+ *     and END timeout paths; the STOPPED timeout path was an oversight. A stale
+ *     EVENTS_END would cause the next read_battery_voltage() EVENTS_END wait to
+ *     exit immediately with no valid conversion. Dead code until Phase 3; the
+ *     BEFORE ENABLING comment is updated to confirm the fix is present.
+ *   - init_bmp581() Steps 4 and 5: OSR_CONFIG and ODR_CONFIG readbacks are now
+ *     validated, not merely printed. A failed I2C read now returns false (was
+ *     silently skipped). A mismatch between written and read-back value now
+ *     returns false (was ignored). Without this check, a silent write failure
+ *     leaving PRESS_EN=0 would cause pressure to stay at 0x7F7F7F while
+ *     init_bmp581() returned true — exactly the failure mode that caused
+ *     extended debugging earlier in the project.
+ *   - init_bmp581() Step 7 failure message generalised: was "All reads 0x7F7F7F"
+ *     which is inaccurate if the cause is an I2C read failure or out-of-range
+ *     pressure. Message now covers all five-read failure outcomes.
+ *   - H3LIS FSR packing: (int16_t)0xFFF0 replaced with unsigned domain arithmetic.
+ *     0xFFF0 = 65520 exceeds INT16_MAX; the narrowing cast to int16_t is
+ *     implementation-defined in C99/C11. Same class as the 12-site v3.11 fix in
+ *     sensors_read(). No behaviour change on GCC/Cortex-M4 (two's complement),
+ *     but removes the standard non-conformance. All three packing lines corrected.
+ *   - LSM6_CTRL1_XL_VAL comment: FS_XL[3:2] corrected from "11" to "01". 0x66
+ *     bits [3:2] = 01 = +/-16g on LSM6DSOX; "11" would be +/-8g. LPF2_XL_EN
+ *     (bit 1 = 1) documented: enables 104Hz LPF2 on accel output via reset-default
+ *     CTRL8_XL. Previously undocumented side-effect of the register value.
+ *   - init_bmp581() Step 7: nrf_delay_ms(50) skipped on the final (5th) attempt.
+ *     Previously the delay executed unconditionally on every loop iteration
+ *     including the last, adding a wasted 50ms at the end of a failed BMP init
+ *     sequence before returning false. No behaviour change on success paths.
  *
  * Changelog from 3.11 (sensors.c only, no main.c changes):
  *   - sensors_read_temperature(): uint32_t cast applied before shift in 24-bit
@@ -134,7 +152,9 @@ extern int SEGGER_RTT_printf(unsigned BufferIndex, const char * sFormat, ...);
 // LSM6DSOX configuration register values
 // Changing the gyro range requires updating both the register value AND the
 // packet_spec.h scaling comment.
-#define LSM6_CTRL1_XL_VAL   0x66    // ODR[7:4]=0110=416Hz, FS_XL[3:2]=11=+/-16g
+#define LSM6_CTRL1_XL_VAL   0x66    // ODR[7:4]=0110=416Hz, FS_XL[3:2]=01=+/-16g,
+                                    // LPF2_XL_EN(bit1)=1 — enables 104Hz LPF2 on
+                                    // accel output via reset-default CTRL8_XL
 #define LSM6_CTRL2_G_VAL    0x64    // ODR[7:4]=0110=416Hz, FS_G[3:2]=01=+/-500dps
                                     // NOTE: 0x68 = +/-1000dps — do NOT use (was a bug)
 #define LSM6_CTRL3_C_VAL    0x44    // BDU(bit6)=1, IF_INC(bit2)=1
@@ -223,6 +243,14 @@ static uint8_t bmp_addr   = 0;
 // Initialised to 0x00: do not report sensors OK before detection runs
 static uint8_t  runtime_sensor_status = 0x00;
 static uint16_t i2c_error_count = 0;
+// i2c_error_count wraps (not saturates) at 65535. i2c_read_regs() can increment
+// it twice per call (TX phase + RX phase). With 5 sensor reads per sensors_read()
+// loop at 250Hz, sustained intermittent I2C noise could wrap the counter in under
+// a minute — faster than tx_timeout_count wraps. A wrap would show 0 errors in
+// the status log while errors are actively accumulating. In practice the WDT fires
+// on any call that blocks indefinitely (~0.5s), so a persistent total I2C failure
+// that would cause rapid wrapping is also a WDT scenario. The full accumulated
+// count is not preserved across wraps; this is diagnostic-only behaviour.
 // fsr_initialized: set true by fsr_init(), but only READ inside the #if 0 block
 // in fsr_read(). Currently a write-only variable in the Phase 2 build. It gates
 // the SAADC sequence in Phase 3 to guard against fsr_read() being called before
@@ -312,6 +340,14 @@ static bool fsr_read(uint16_t *fsr_out)
           (FSR_CONTACT_THRESHOLD=80 and >>6 intensity scaling) are calibrated
           for 10-bit (0-1023). Without save/restore the threshold is 4x too sensitive.
 
+          BEFORE ENABLING: confirm all three SAADC timeout paths clear EVENTS_END:
+            - STARTED timeout: EVENTS_END cleared (see below) ✓
+            - END timeout: EVENTS_END cleared (see below) ✓
+            - STOPPED timeout: EVENTS_END cleared (see below) ✓
+          TASKS_STOP can generate EVENTS_END per nRF52840 PS. A stale EVENTS_END
+          would cause the next read_battery_voltage() EVENTS_END wait to exit
+          immediately with no valid conversion.
+
           Wiring targets:
             FSR0 -> P0.03 (SAADC Ch1)
             FSR1 -> P0.04 (SAADC Ch2)
@@ -388,6 +424,10 @@ static bool fsr_read(uint16_t *fsr_out)
     // return immediately before the peripheral has actually stopped.
     NRF_SAADC->EVENTS_STOPPED = 0;
     if (timeout == 0) {
+        // TASKS_STOP can generate EVENTS_END per nRF52840 PS (same as saadc_stop_and_wait).
+        // Clear it here so the next read_battery_voltage() EVENTS_END wait does not exit
+        // immediately with no valid conversion.
+        NRF_SAADC->EVENTS_END = 0;
         NRF_SAADC->RESOLUTION = saved_res;
         memset(fsr_out, 0, 4 * sizeof(uint16_t));
         return false;
@@ -516,13 +556,14 @@ static bool init_bmp581(void)
     if (!i2c_write_reg(bmp_addr, BMP_OSR_CONFIG, BMP_OSR_CONFIG_VAL)) {
         SEGGER_RTT_printf(0, "  FAILED\r\n"); return false;
     }
-    if (i2c_read_reg(bmp_addr, BMP_OSR_CONFIG, &reg_val)) {
-        SEGGER_RTT_printf(0, "  OSR_CONFIG readback=0x%02X (expect 0x%02X)\r\n",
-            reg_val, BMP_OSR_CONFIG_VAL);
-        if (reg_val != BMP_OSR_CONFIG_VAL) {
-            SEGGER_RTT_printf(0, "  FAILED: OSR_CONFIG readback mismatch (PRESS_EN may not be set)\r\n");
-            return false;
-        }
+    if (!i2c_read_reg(bmp_addr, BMP_OSR_CONFIG, &reg_val)) {
+        SEGGER_RTT_printf(0, "  FAILED: OSR_CONFIG readback I2C error\r\n"); return false;
+    }
+    SEGGER_RTT_printf(0, "  OSR_CONFIG readback=0x%02X (expect 0x%02X)\r\n",
+        reg_val, BMP_OSR_CONFIG_VAL);
+    if (reg_val != BMP_OSR_CONFIG_VAL) {
+        SEGGER_RTT_printf(0, "  FAILED: OSR_CONFIG mismatch — PRESS_EN may not be set\r\n");
+        return false;
     }
     nrf_delay_ms(10);
 
@@ -530,13 +571,14 @@ static bool init_bmp581(void)
     if (!i2c_write_reg(bmp_addr, BMP_ODR_CONFIG, BMP_ODR_CONFIG_VAL)) {
         SEGGER_RTT_printf(0, "  FAILED\r\n"); return false;
     }
-    if (i2c_read_reg(bmp_addr, BMP_ODR_CONFIG, &reg_val)) {
-        SEGGER_RTT_printf(0, "  ODR_CONFIG readback=0x%02X (expect 0x%02X)\r\n",
-            reg_val, BMP_ODR_CONFIG_VAL);
-        if (reg_val != BMP_ODR_CONFIG_VAL) {
-            SEGGER_RTT_printf(0, "  FAILED: ODR_CONFIG readback mismatch\r\n");
-            return false;
-        }
+    if (!i2c_read_reg(bmp_addr, BMP_ODR_CONFIG, &reg_val)) {
+        SEGGER_RTT_printf(0, "  FAILED: ODR_CONFIG readback I2C error\r\n"); return false;
+    }
+    SEGGER_RTT_printf(0, "  ODR_CONFIG readback=0x%02X (expect 0x%02X)\r\n",
+        reg_val, BMP_ODR_CONFIG_VAL);
+    if (reg_val != BMP_ODR_CONFIG_VAL) {
+        SEGGER_RTT_printf(0, "  FAILED: ODR_CONFIG mismatch\r\n");
+        return false;
     }
     nrf_delay_ms(100);
 
@@ -568,12 +610,14 @@ static bool init_bmp581(void)
                 return true;
             }
         }
-        nrf_delay_ms(50);
+        // Skip the inter-attempt delay after the final attempt — it adds 50ms
+        // of wasted wait before returning false with no further reads to benefit.
+        if (attempt < 4) nrf_delay_ms(50);
     }
 
     SEGGER_RTT_printf(0, "=== BMP581 FAILED ===\r\n");
-    SEGGER_RTT_printf(0, "All reads returned 0x7F7F7F\r\n");
-    SEGGER_RTT_printf(0, "Possible causes: PRESS_EN not set (check 0x%02X), wiring, defective module\r\n\r\n",
+    SEGGER_RTT_printf(0, "All 5 pressure reads returned invalid data (0x7F7F7F, I2C error, or out-of-range)\r\n");
+    SEGGER_RTT_printf(0, "Possible causes: PRESS_EN not set (check readback 0x%02X), wiring, defective module\r\n\r\n",
         BMP_OSR_CONFIG_VAL);
     return false;
 }
@@ -834,15 +878,15 @@ void sensors_read(sensor_data_t *data)
             if (fsr_raw[2] > FSR_CONTACT_THRESHOLD) fsr_pattern |= 0x04;
             if (fsr_raw[3] > FSR_CONTACT_THRESHOLD) fsr_pattern |= 0x08;
 
-            // Unsigned domain arithmetic: (int16_t)0xFFF0 would be an implementation-defined
-            // cast (65520 > INT16_MAX). Cast h3lis_raw to uint16_t first so the AND is in the
-            // unsigned domain; cast the result back to int16_t (well-defined two's complement
-            // truncation on any conforming implementation). Same pattern as the 12-site fix
-            // documented in the v3.11 changelog.
-            data->h3lis_x_fsr_level   = (int16_t)(((uint16_t)h3lis_raw[0] & 0xFFF0U) | ((uint16_t)fsr_intensity & 0x0FU));
-            data->h3lis_y_fsr_pattern = (int16_t)(((uint16_t)h3lis_raw[1] & 0xFFF0U) | ((uint16_t)fsr_pattern  & 0x0FU));
+            // Unsigned domain arithmetic throughout: (int16_t)0xFFF0 exceeds
+            // INT16_MAX (65520 > 32767); the narrowing cast is implementation-defined
+            // in C99/C11. Casting to uint16_t before AND/OR keeps all arithmetic
+            // in the unsigned domain; the final int16_t cast is a well-defined
+            // two's complement reinterpretation on any C99/C11 conforming target.
+            data->h3lis_x_fsr_level   = (int16_t)(((uint16_t)h3lis_raw[0] & 0xFFF0u) | (uint16_t)fsr_intensity);
+            data->h3lis_y_fsr_pattern = (int16_t)(((uint16_t)h3lis_raw[1] & 0xFFF0u) | (uint16_t)fsr_pattern);
             // Lower 4 bits of z-axis field are reserved; mask clears them.
-            data->h3lis_z_flags       = (int16_t) ((uint16_t)h3lis_raw[2] & 0xFFF0U);
+            data->h3lis_z_flags       = (int16_t)((uint16_t)h3lis_raw[2] & 0xFFF0u);
             runtime_sensor_status |= SENSOR_H3LIS_OK;
         } else {
             data->h3lis_x_fsr_level   = 0;
