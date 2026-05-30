@@ -1,6 +1,6 @@
 # MIDI Juggling Balls — Project Reference
 
-**Version:** Post exhaustive TX code review (TX v3.15, RX v1.5, Decoder v1.6, full pipeline validated clean)
+**Version:** TX v3.18+fixes+batt-log+bmp-addr+batt-vdiv-fix2+wdt-ctx+sdk-assert+tx-rate-199+i2c-250k+twi-recovery2 / RX v1.11
 **Goal:** Wireless juggling ball → sensor data → sound reinforcing visual performance
 **Repo:** https://github.com/Minrat1995/MIDI-Juggling-Balls (private)
 **Target:** <20ms perceived latency, <1% packet loss, scalable to 3+ balls
@@ -9,83 +9,495 @@
 
 ## CURRENT STATUS
 
-### What is done
-- TX firmware v3.15: exhaustive multi-round code review complete. All identified issues
-  resolved. Validated running on hardware (RTT confirmed, all sensors OK, pipeline clean).
-  TX has run for 2+ hours without freeze on J-Link RTT — freeze issue may be resolved or
-  intermittent; continue monitoring under extended conditions.
-  Code considered production-ready pending watchdog addition and RX equivalent review.
-  Key fixes across v3.7–v3.15: CRCPOLY/CRCINIT/PREFIX0 readback added to radio_init;
-  sensors_test() called at startup; get_timestamp_ms() renamed get_rtc_ticks();
-  HFCLK/LFCLK startup timeouts (10ms/1000ms); saadc_stop_and_wait() helper for correct
-  SAADC sequencing; saadc_stop_and_wait() clears EVENTS_END (v3.14 — TASKS_STOP can
-  generate EVENTS_END per nRF52840 PS; stale event caused immediate-exit on next call);
-  LSM6DSOX status bit symmetry; recover_radio() status reset;
-  forward declaration for indicate_error_fatal(); duplicate forward declaration removed;
-  Phase 3 fsr_read SAADC scan layout corrected (MAXCNT=5, skip CH0 battery sample);
-  Phase 3 fsr_read SAADC timeout error paths all leave clean peripheral state;
-  raw byte assembly corrected at all sensor read sites — 12 sites in sensors_read()
-  (v3.11) plus sensors_read_temperature() and init_bmp581() (v3.12), all well-defined C99/C11;
-  temperature RTT display sign corrected for sub-zero fractions (v3.13);
-  TX_INTERVAL_MS renamed TX_INTERVAL_TICKS; timing wrap arithmetic (uint16_t) cast
-  inserted at both sites in main loop (v3.15).
-- RX firmware v1.5: end-to-end radio validated, ~1-2% RF packet loss benchtop. **Exhaustive
-  code review not yet performed — queue for next session (same process as TX).**
-- USB framing: confirmed working end-to-end. 0 resyncs, decoder queue drops = 0
-- C++ decoder v1.6: auto-detects COM14 via SERIALCOMM registry fallback, decodes to correct physical values
-- Full data pipeline confirmed: TX → radio → RX → USB → decoder → console output
-- LIS3MDL confirmed running at 155Hz (FAST_ODR, CTRL_REG1=0xFE)
-- All sensors confirmed at startup: LSM6=0x6A LIS3=0x1C H3LIS=0x18 BMP=0x46 (CHIP_ID=0x50)
-- Decoder drain-loop fix confirmed: queue_drops=0 in steady state
+### What is working
 
-### Immediate next tasks
-1. **Exhaustive code review of RX firmware (same process as TX — two full passes, senior
-   engineer scrutiny, produce clean files + deploy + git scripts)**
-2. Implement OSC output in decoder (stub already in place)
-3. Connect Pure Data patch, ASIO output
-4. Success criterion: move ball, hear sensor data drive audio in real time
+- Perfboard bench assembly complete: STEMMA QT chain assembled, all four sensors confirmed
+  in RTT banner. GND resistance 1.2Ω end-to-end on STEMMA chain.
+- **Direct GND wire added: BMP581 GND pad → Feather GND pin (star topology). This is the
+  fix that resolved standalone dropout. 1+ hour confirmed stable standalone run achieved.**
+- All four sensors at correct addresses: LSM6DSOX 0x6A, LIS3MDL 0x1C, H3LIS331 0x18, BMP581 0x47.
+- Battery reads correctly: 4159–4161mV confirmed on a charged cell (AIN5 fix — see below).
+- Non-blocking TWI with per-transaction timeout in sensors.c. TWI0_USE_EASY_DMA=1 confirmed.
+- TASKS_STOP + EVENTS_STOPPED poll before uninit in twi_wait().
+- twi-recovery2: POWER=0/1 deep lockup recovery, NVIC disable/clear around uninit, SDA
+  pre-flight check at sensors_read() entry. All flashed and running.
+- I2C clock reduced from 400kHz to 250kHz (i2c-250k). TX rate reduced to ~199Hz
+  (TX_INTERVAL_TICKS=5, 5.035ms) to stay within USB Full Speed ceiling at 3 balls.
+- app_error_fault_handler() non-weak override: writes 0xBB to GPREGRET, fault id to GPREGRET2.
+  SREQ banner path correctly decodes 0xBB and prints SDK fault id.
+- WDT context diagnostic: g_wdt_context updated at key loop/recovery points; WDT_IRQHandler
+  writes value to GPREGRET ~122us before reset; next boot banner decodes location of stall.
+- WDT HALT=Run, SLEEP=Run. Feeds at 8 sites in main.c, feeds in sensors.c twi_wait() and
+  init_bmp581(). WDT interrupt enabled (INTENSET.TIMEOUT, priority 7).
+- HardFault_Handler: writes GPREGRET=0xAA, NVIC_SystemReset().
+- GPREGRET/GPREGRET2 failure encoding covers: HardFault (0xAA), SDK assert (0xBB), init
+  failures (0x01–0x05 in GPREGRET2), and WDT context (0x01–0x14 in GPREGRET).
+- DMA-safe s_rx_buf in sensors.c. RTT non-blocking confirmed. RTC1 ticking (diff=0 confirmed).
+- indicate_error_fatal(): LED solid on + WDT feed loop indefinitely.
+- RX firmware v1.11: comprehensive multi-pass code review applied. Full pipeline confirmed
+  working. Key improvements: main loop reordered so usb_serial_process() runs before send
+  (was causing every-other-packet drops via s_tx_busy not cleared in time); decode deferred
+  from hot path to 1Hz stats display; CLOCK_CONFIG_LF_SRC = 1 added to sdk_config.h (was
+  defaulting to RC oscillator, making all timing constants wrong); RTT buffer increased from
+  512 to 2048 bytes (sufficient for 8 balls); NVIC_EnableIRQ moved to after readback
+  verification in radio_init(); USB Full Speed ceiling documented.
+- Full data pipeline confirmed: TX → radio → RX → USB → decoder → console output.
 
-### Known open issue — TX freeze after ~10-15 minutes
-Observed in earlier sessions: TX RTT goes silent, requires manual restart. Most recent
-extended run (2+ hours) completed without freezing. Status uncertain — may be resolved,
-or may be intermittent. Genuine TWI driver hang (nrf_drv_twi blocking on Errata 89/121)
-remains the most likely cause if it recurs. Watchdog (NVIC_SystemReset()) still planned
-before Phase 2 extended testing as belt-and-suspenders.
-Diagnostic: when freeze occurs, note whether TX RTT is also silent (confirms TX-side cause).
+### TX dropout: RESOLVED
 
-### RF loss pattern observed
-Benchtop loss settles in one of two stable states: ~1-2% or <0.5%. Transitions are abrupt
-at session start and tend to stay in whichever state they land. Isolated single-packet losses,
-not bursts. Consistent with WiFi channel 6 (2437MHz) interference on RF channel 40 (2440MHz).
-Mitigation: test channels 20 and 80 if loss is consistently above 1%.
+Root cause confirmed and fixed. See dropout history below for full record.
+
+#### Dropout history (closed — issue resolved)
+
+**Previous sessions:** dropouts presented as RESET REASON: power-on (brownout) due to
+high-resistance breadboard GND. Perfboard fixed the brownout — GND resistance dropped
+from 3–7Ω to 1.2Ω.
+
+**Perfboard sessions — progression of observed failure modes:**
+
+1. **RESET REASON: WDT, no failure signature.** WDT firing in running main loop.
+   twi_wait() timeout path called nrf_drv_twi_uninit() which blocked indefinitely with
+   DMA in-flight. Fix: TASKS_STOP + EVENTS_STOPPED poll before uninit.
+
+2. **RESET REASON: soft reset, no failure signature.** SDK's weak app_error_fault_handler()
+   called NVIC_SystemReset() with no GPREGRET write. I2C noise → EVENTS_ERROR → TWIM state
+   machine → NRFX_ASSERT() → silent reset. Fix: non-weak override writes 0xBB/fault-id.
+
+3. **J-Link confirmed to prevent dropout** (1+ hour clean with J-Link, seconds–minutes
+   without). J-Link's SWD GND provides a low-impedance return path, reducing GND bounce
+   during I2C transactions. Root cause confirmed as GND impedance.
+
+4. **RESET REASON: WDT, context not captured.** WDT interrupt did not fire, indicating
+   PRIMASK was set at time of stall — stall occurred inside an SDK critical section with
+   global interrupts disabled. Software alone cannot prevent this.
+
+5. **Hardware fix applied: direct GND wire, BMP581 GND pad → Feather GND pin (star
+   topology, 28–30 AWG stranded).** Result: 1+ hour confirmed stable standalone run.
+   Issue closed.
+
+**Root cause summary:** STEMMA QT chain GND path had ~1.2Ω end-to-end resistance. Transient
+I2C currents caused GND bounce that settled within 2.5μs at 400kHz but was marginal. The
+direct GND wire reduced the return path impedance to ~0.1Ω, eliminating the bounce.
+Software mitigations (250kHz I2C, TASKS_STOP, NVIC disable/clear, POWER=0/1, SDA
+pre-flight) remain in place as belt-and-braces for the PCB design.
+
+#### Hardware GND topology (current, floating prototype)
+
+- STEMMA QT chain: Feather → LSM6DSOX → LIS3MDL → H3LIS331 → BMP581 (star 3V3/GND via chain)
+- Direct GND wire: BMP581 GND pad → Feather GND pin (28–30 AWG stranded, ~2–5cm)
+- Assembly: floating components, bubble wrap between layers, no perfboard mount yet
+- LIS3MDL kept away from LiPo to minimise DC magnetic bias on mag readings
+- Note: relative battery movement during throws may cause low-frequency mag noise;
+  acceptable for prototype (mag is lowest-priority sensor for sound mapping)
+
+#### Next hardware milestone
+
+Star GND topology: add individual direct GND wires from LSM6DSOX and LIS3MDL to Feather
+GND if any dropout recurs. Not required based on current stable run — hold in reserve.
+The custom PCB (Phase 4) will implement full star GND pour, making individual wires
+unnecessary.
+
+---
+
+## THIS SESSION'S CHANGES (for commit)
+
+### TX firmware — main.c
+
+**SDK assert override (sdk-assert):**
+- app_error_fault_handler() non-weak override added. SDK weak default calls
+  NVIC_SystemReset() with no GPREGRET write, producing soft reset with no signature.
+  Override writes 0xBB to GPREGRET and fault id low byte to GPREGRET2, then resets.
+- app_error.h included in include block (required for prototype).
+- Boot banner SREQ path checks for 0xBB and reports SDK fault id.
+- GPREGRET2 init-stage decode guarded against gpr==0xBB to prevent false decode.
+- Clean-boot check (`gpr==0 && gpr2==0`) documented against 0xBB+gpr2=0 edge case.
+
+**TX rate reduction (tx-rate-199):**
+- TX_INTERVAL_TICKS changed 4 → 5. At 250Hz × 3 balls × 89 bytes = 66,750 bytes/sec,
+  which exceeds the USB Full Speed bulk endpoint ceiling (64,000 bytes/sec). At ~199Hz
+  (5 ticks, 5.035ms): 3 balls × 89 bytes = 53,133 bytes/sec = 83% of ceiling.
+- Sensor ODR vs TX rate ratios updated in file header.
+- WDT margin comment updated (~100 loop iterations at ~199Hz).
+- sensor_history comment updated: t-5ms, t-10ms.
+- RTT banner updated: "~199Hz (5ms)".
+- Version string updated in both @version header and RTT printf banner.
+
+**Code review fixes (previous session):**
+- runtime_sensor_status reset to 0x00 at sensors_init() entry (sensors.c). Previously
+  stale status bits from a failed first attempt could persist into Fix C retry.
+
+**Code review fixes (this session — senior review pass):**
+- HFCLK_STARTUP_TIMEOUT_MS: 10ms → 100ms (main.c). nRF52840 HFXO can take up to 6ms;
+  10ms left <4ms margin. Same bug was previously fixed to 100ms on RX.
+- emergency_shutdown(): bounded EVENTS_DISABLED poll (1ms) added between TASKS_DISABLE
+  and SYSTEMOFF (main.c). Prevents entering SYSTEMOFF with radio DMA potentially active.
+- sensors_read() entry guard: lis3_addr == 0 added alongside lsm6_addr == 0 (sensors.c).
+  LIS3MDL is required; guard now returns zeros rather than calling i2c_read_regs(0,...).
+- sdk_config.h: CLOCK_CONFIG_LF_SRC = 1 added. TX timing_init() overrides the SDK clock
+  module's LFCLK selection, so this was not causing failures; added for correctness and
+  to remove the dependency on timing_init() being reached before any LFCLK-sensitive code.
+- project_reference.md PACKET SPECIFICATION table: data_t1/data_t2 corrected from
+  t-4ms/t-8ms to t-5ms/t-10ms (missed when packet_spec.h was updated).
+
+### Hardware
+
+**Direct GND wire added:**
+- 28–30 AWG stranded wire, BMP581 GND pad → Feather GND pin.
+- Provides parallel low-impedance GND return path (~0.1Ω) alongside STEMMA chain (~1.2Ω).
+- Result: first confirmed 1+ hour stable standalone run. Dropout issue resolved.
+
+### packet_spec.h
+
+- File header rate updated: 250Hz (4ms) → ~199Hz (5.035ms intervals).
+- data_t1/data_t2 descriptions updated: t-4ms/t-8ms → t-5ms/t-10ms (three locations).
+- Must be copied to both tx\ and rx\ in repo (shared contract).
+
+---
+
+## OUTSTANDING ITEMS
+
+### 1. Commit current firmware and run full commit routine
+
+Files to commit:
+- tx\main.c    — sdk-assert + tx-rate-199 + code-review fixes (HFCLK timeout, emergency_shutdown DISABLE wait)
+- tx\sensors.c — twi-recovery2 + i2c-250k + wdt-ctx markers + runtime_sensor_status reset + code-review fix (lis3_addr guard)
+- tx\sdk_config.h — CLOCK_CONFIG_LF_SRC = 1 added
+- tx\packet_spec.h — t1/t2 timing updated for ~199Hz
+- rx\packet_spec.h — must match tx\packet_spec.h exactly (fc check in commit routine)
+
+Expected banner after flash:
+```
+=== Juggling Ball TX (Ball 1) v3.18+fixes+batt-log+bmp-addr+batt-vdiv-fix2+wdt-ctx+sdk-assert+tx-rate-199 ===
+Transmitting at ~199Hz (5ms). Status every 120s.
+```
+
+### 2. Revert TX power 0dBm → +8dBm
+
+Was reduced as a diagnostic step during dropout investigation. Dropout resolved — restore
+TX_POWER to RADIO_TXPOWER_TXPOWER_Pos8dBm in main.c before Phase 1.5 testing.
+
+### 3. Proceed to Phase 1.5: OSC output and Pure Data connection
+
+Hardware stable. Pipeline confirmed. Next milestone: OSC output from PC decoder into
+Pure Data for initial sensor-to-sound mapping experiments.
+
+---
+
+## PHASE PLAN
+
+### Phase 1 (complete)
+- All sensors validated on TX RTT
+- End-to-end radio validated: TX → RX → RTT, <0.5% packet loss benchtop
+- USB CDC confirmed: 89-byte framed packets to PC
+- C++ decoder confirmed: clean framing, 0 resyncs
+
+### Phase 1.5 (current): OSC output and Pure Data connection
+- Non-blocking TWI, DMA safety, WDT feeds, RTC fix, diagnostics all in place ✓
+- Battery reading confirmed correct ✓
+- Perfboard assembly complete ✓
+- Software mitigations for I2C noise applied ✓
+- Direct GND wire added (BMP581 → Feather GND) ✓
+- **TX dropout resolved: 1+ hour confirmed stable standalone run ✓**
+- TX rate reduced to ~199Hz (TX_INTERVAL_TICKS=5): USB ceiling resolved for 3 balls ✓
+- **CURRENT ACTION: commit firmware, revert TX power to +8dBm, begin OSC output**
+
+### Phase 2: Sensor-to-sound mapping
+- Experiment: height (BMP ~8Pa/m), spin (mag+gyro), impact (H3LIS), squeeze (FSR)
+- MIDI discrete events: impact note triggers, FSR contact transitions
+- Decision point: if packet loss >1% in performance, implement t1/t2 gap-fill
+- **Ring buffer required before adding a second ball.** At 2 balls × ~199Hz the inter-packet
+  interval is ~5ms. USB DMA time is ~2ms; there is margin, but a ring buffer is still
+  required for robust multi-ball handling.
+- **USB throughput ceiling:** resolved for 3 balls at ~199Hz (53,133 bytes/sec = 83% of
+  USB Full Speed ceiling). Ring buffer and revised framing still required for Phase 2.
+
+### Phase 3: Multi-ball (3 balls simultaneous)
+- BLE provisioning to assign ball_id
+- Wire all 4 FSRs
+- Resolved USB throughput ceiling from Phase 2
+
+### Phase 4: Performance ready
+- 30+ minute stress testing
+- Battery 2+ hours
+- Custom PCB from JLCPCB/PCBWay (~USD$5–15 for 5 boards) once perfboard design stable.
+  Eliminates inter-board wiring entirely, allows form factor designed around ball interior.
+
+---
+
+## LATENCY BUDGET
+
+| Stage | Time |
+|-------|------|
+| Sensor avg wait (~199Hz loop) | ~2.5ms |
+| I2C read (all sensors, 250kHz) | ~2.1ms |
+| Radio TX (86 bytes @ 2Mbps) | ~0.37ms |
+| USB CDC to PC | ~1ms |
+| C++ decode | ~1ms |
+| Pure Data ASIO buffer | ~10–20ms (tunable) |
+| **Total estimated** | **~16–26ms** |
+
+Note: I2C read time increased from ~1ms to ~2.1ms following 400kHz → 250kHz reduction.
+Total latency budget unchanged within spec.
+
+---
+
+## BUGS FIXED (all sessions — condensed)
+
+| Bug | File | Impact |
+|-----|------|--------|
+| nrf_drv_twi blocking mode on hang (TX) | sensors.c | handler=NULL = blocking; TWI hang stalls forever. Fix: non-blocking + twi_wait() timeout |
+| TWI0_USE_EASY_DMA absent (TX) | sdk_config.h | Legacy blocking backend used regardless of handler. Fix: TWI_ENABLED=1, TWI0_USE_EASY_DMA=1, TWIM_ENABLED=1 |
+| WDT feed missing in twi_wait() timeout path (TX) | sensors.c | Recovery work exceeds 500ms; WDT fires during known recovery window. Fix: feeds before and after uninit |
+| TASKS_STOP missing before uninit in twi_wait() (TX) | sensors.c | uninit() may block indefinitely if DMA in-flight. Fix: TASKS_STOP + EVENTS_STOPPED poll before uninit |
+| POWER=0/1 missing for deep lockup in twi_wait() (TX) | sensors.c | TASKS_STOP insufficient for Errata 89/121 deep lockup. Fix: POWER cycle when EVENTS_STOPPED times out |
+| NVIC not disabled around uninit in twi_wait() (TX) | sensors.c | Stale TWIM IRQ in UNINITIALIZED state → NRFX_ASSERT → soft reset. Fix: NVIC disable/clear |
+| SDA pre-flight check absent (TX) | sensors.c | Stuck bus on sensors_read() entry causes immediate EVENTS_ERROR. Fix: SDA pin check + recovery before first transaction |
+| DMA-unsafe RX buffer in i2c_read_regs() (TX) | sensors.c | DMA writes into freed stack on timeout, causing HardFault. Fix: s_rx_buf static buffer + memcpy |
+| RTT buffer blocking without J-Link (TX) | main.c | SEGGER_RTT_printf blocks when buffer full; WDT fires. Fix: runtime SetFlagsUpBuffer(NO_BLOCK_SKIP) |
+| RTC COUNTER stuck at 0 (TX) | main.c | LFCLK released by SDK after TWI init; RTC gets no clock. Fix: explicit LFCLK stop/restart in timing_init() |
+| WDT fires during LFCLK startup wait (TX) | main.c | LFXO startup 200-600ms; no WDT feed in loop. Fix: WDT feed on every iteration |
+| WDT feed missing after 500ms startup delay (TX) | main.c | Delay consumes entire feed #1 window; WDT fires in sensors_init(). Fix: feed #1b added after delay |
+| No HardFault handler (TX) | main.c | HardFault = permanent CPU hang, no recovery. Fix: HardFault_Handler writes GPREGRET=0xAA, resets |
+| No failure diagnostics across resets (TX) | main.c | Could not distinguish WDT/HardFault/brownout. Fix: GPREGRET/GPREGRET2 encode failure site |
+| No WDT stall location diagnostic (TX) | main.c | WDT reset gives no information on where stall occurred. Fix: g_wdt_context + WDT_IRQHandler |
+| SDK assert produces clean soft reset (TX) | main.c | NRFX_ASSERT fires app_error_fault_handler (weak), which resets with no signature. Fix: non-weak override writes 0xBB |
+| Battery pin wrong: AIN7 (AREF) instead of AIN5 (TX) | main.c | P0.31 is AREF, not available for ADC. All previous battery reads were floating. Fix: AIN5 (P0.29) |
+| Spurious VBAT_VDIV_ENABLE_PIN on P0.14 (TX) | main.c | Feather has no FET on battery divider. P0.14 GPIO drive had no effect. Fix: removed entirely |
+| I2C at 400kHz too fast for GND noise margin (TX) | sensors.c | GND bounce at 1.2Ω doesn't settle within 2.5μs bit period. Fix: 250kHz (4μs bit period) |
+| WDT HALT=Pause (TX) | main.c | Behaviour differs between J-Link and standalone. Fix: HALT=Run for consistent behaviour |
+| indicate_error_fatal() blink too brief to observe (TX) | main.c | 4-second blink burst missed. Fix: LED solid on + WDT feed loop indefinitely |
+| Timing resync RTT flood (TX) | main.c | Broken RTC caused ~10 RTT prints/sec; flooded buffer. Fix: print removed |
+| radio_recoveries inflated by pre-session watchdog fires (RX) | radio_rx.c | Counter useless as diagnostic. Fix: s_session_active flag |
+| usb_serial_process() called after send — TX_DONE not cleared (RX) | main.c | Every other packet dropped via s_tx_busy guard. Fix: process() moved to top of loop |
+| CLOCK_CONFIG_LF_SRC absent from sdk_config.h (RX) | sdk_config.h | SDK defaulted to RC oscillator (±500ppm); all timing constants assumed crystal. Fix: LF_SRC = 1 |
+| NVIC_EnableIRQ before readback in radio_init() (RX) | radio_rx.c | Readback failure left ISR armed on misconfigured peripheral. Fix: NVIC_EnableIRQ gated on success |
+| radio_recover() called radio_start_rx() after failed radio_init() (RX) | radio_rx.c | Started hardware without armed ISR; packets received silently. Fix: early return on init failure |
+| usb_serial_process() called if USB init failed (RX) | usb_serial.c | Called into uninitialised USB stack state. Fix: s_usb_init_ok guard |
+| SEGGER_RTT_CONFIG_DEFAULT_MODE absent (RX) | sdk_config.h | RTT defaulted to blocking mode; full buffer caused main loop stall and radio packet loss. Fix: mode=0 added |
+| RTT buffer 512 bytes — overflows at 2+ balls (RX) | sdk_config.h | Stats print silently dropped at 2+ balls. Fix: 2048 bytes |
+| HFCLK startup timeout 10ms too tight (RX) | main.c | nRF52840 HFXO can take up to 6ms; <4ms margin caused false fatal halts. Fix: 100ms |
+| send_text() zero-length locks s_tx_busy permanently (RX) | usb_serial.c | NRF_SUCCESS returned with no DMA; TX_DONE never fires. Fix: early return on len==0 |
+| BMP581 address wrong: 0x46 instead of 0x47 (TX) | sensors.c | Sensor not found at init. Fix: 0x47 is factory default |
+| External pull-up resistors (hardware design) | wiring | Unnecessary — onboard 10kΩ on each breakout = ~3.3kΩ effective |
+| Bulk decoupling cap undersized (hardware) | wiring | 10µF replaced with 330µF 25V electrolytic at Feather 3.3V/GND |
+| Breadboard ground wiring (hardware) | wiring | 3–7Ω contact resistance causes brownout resets. Fix: perfboard build (complete) |
+| GND impedance on STEMMA QT chain (hardware) | wiring | 1.2Ω chain GND causes I2C noise → TWIM faults → crashes. Fix: direct BMP581→Feather GND wire (~0.1Ω parallel path). 1+ hour stable run confirmed |
+| TX rate 250Hz exceeds USB FS ceiling at 3 balls (TX) | main.c | 250Hz × 3 × 89 = 66,750 bytes/sec > 64,000 ceiling. Fix: TX_INTERVAL_TICKS=5 (~199Hz); 3 balls = 83% of ceiling |
+| runtime_sensor_status not reset at sensors_init() entry (TX) | sensors.c | Stale status bits from failed first attempt persist into Fix C retry. Fix: reset to 0x00 at init entry |
+| HFCLK startup timeout 10ms too tight (TX) | main.c | Same as RX bug (fixed earlier). nRF52840 HFXO can take up to 6ms; 10ms left <4ms margin, risking GPREGRET2=0x04 false halt. Fix: 100ms |
+| emergency_shutdown() enters SYSTEMOFF without waiting for radio DISABLE (TX) | main.c | Radio could be mid-TX with DMA active when SYSTEMOFF is reached. Fix: bounded 1ms EVENTS_DISABLED poll before SYSTEMOFF |
+| sensors_read() entry guard missing lis3_addr == 0 check (TX) | sensors.c | If lis3_addr were 0 while twi_initialized=true, i2c_read_regs(0,...) would run and NACK on address 0. Fix: lis3_addr == 0 added to guard |
+| CLOCK_CONFIG_LF_SRC absent from TX sdk_config.h (TX) | sdk_config.h | TX timing_init() overrides SDK LFCLK selection, so not causing failures. Added for correctness and to remove dependency on timing_init() override. Fix: CLOCK_CONFIG_LF_SRC = 1 |
+
+---
+
+## GPREGRET DIAGNOSTIC ENCODING
+
+### GPREGRET (register 0)
+| Value | Meaning |
+|-------|---------|
+| 0x00 | No failure — clean boot or power-cycle |
+| 0xAA | HardFault on previous boot (NVIC_SystemReset from HardFault_Handler) |
+| 0xBB | SDK assert/error (app_error_fault_handler override) — see GPREGRET2 for fault id |
+| 0x01 | WDT stall: top of main loop, about to sensors_read() |
+| 0x02 | WDT stall: inside sensors_read() / TWI operations |
+| 0x03 | WDT stall: transmit_packet() or recover_radio() |
+| 0x04 | WDT stall: log_status_rtt() |
+| 0x05 | WDT stall: timing delay nrf_delay_ms() |
+| 0x10 | WDT stall: twi_wait() timeout detected, entering recovery |
+| 0x11 | WDT stall: twi_wait() TASKS_STOP poll |
+| 0x12 | WDT stall: twi_wait() nrf_drv_twi_uninit() |
+| 0x13 | WDT stall: twi_wait() i2c_bus_recover() |
+| 0x14 | WDT stall: twi_wait() nrf_drv_twi_init() reinit |
+
+### GPREGRET2 (register 1)
+| Value | Meaning |
+|-------|---------|
+| 0x00 | No init failure |
+| 0x01 | sensors_init() first attempt failed |
+| 0x02 | sensors_init() retry (Fix C) failed |
+| 0x03 | radio_init() failed |
+| 0x04 | HFCLK startup timed out |
+| 0x05 | LFCLK startup timed out |
+| 0x01 (when GPREGRET=0xBB) | NRF_FAULT_ID_SDK_ASSERT — ASSERT() in SDK driver |
+| 0x02 (when GPREGRET=0xBB) | NRF_FAULT_ID_SDK_ERROR — APP_ERROR_CHECK() failure |
+
+Both registers survive WDT and soft resets. Cleared by power-on reset (brownout).
+If both read 0x00 after a dropout, it was a brownout — no software code ran.
+
+---
+
+## TX RTT VALIDATION CHECKLIST (no RX needed)
+
+After flashing TX, connect J-Link and open RTT terminal. Expected startup:
+```
+RESET REASON: power-on
+Previous boot: no failure signature (power cycle or clean)
+=== Juggling Ball TX (Ball 1) v3.18+fixes+batt-log+bmp-addr+batt-vdiv-fix2+wdt-ctx+sdk-assert+tx-rate-199 ===
+Packet sizes:
+  radio_packet_t: 86 (expect 86)
+  sensor_data_t:  27 (expect 27)
+  status_packet_t:26 (expect 26)
+I2C bus recovery: SDA was OK (no hang)
+LSM6DSOX at 0x6A
+LIS3MDL at 0x1C
+H3LIS331 at 0x18
+BMP581 at 0x47 (CHIP_ID=0x50)
+  OSR_CONFIG readback=0x52 (expect 0x52)
+  WARNING: no data ready (STATUS=0x01)   <- normal on this unit
+  [1] raw=0x6XXXXX = ~102000 Pa
+=== BMP581 OK ===
+LFCLK+RTC1: PRESCALER=32 COUNTER=19 OK  <- COUNTER must be non-zero
+Battery: 4XXX mV (XX%)                  <- must show realistic mV, NOT "USB-only" when LiPo connected
+Radio OK
+WDT started (timeout 500ms)
+Transmitting at ~199Hz (5ms). Status every 120s.
+DEBUG: loop=250 T=1257 next=1257 diff=0  <- diff must be 0 by loop 250
+```
+
+After WDT reset (if occurs), expected additional lines:
+```
+RESET REASON: WDT (watchdog) -- loop stall detected
+WDT context: 0xXX -- <location string>   <- key diagnostic output
+```
+
+After SDK assert reset:
+```
+RESET REASON: soft reset -- SDK assert/error
+SDK fault: id=0x01 -- NRF_FAULT_ID_SDK_ASSERT (ASSERT() in SDK driver)
+```
+
+---
+
+## RX RTT VALIDATION CHECKLIST
+
+Expected RX output with TX transmitting:
+```
+=== Juggling Ball RX v1.11 ===
+...
+*** Ball 1: first packet seq=XXXX ***
+
+--- RX Stats (every second) ---
+Radio: N OK  0 CRC-fail  N END events  0 ISR-overwrites  0 recoveries
+
+Ball 1: RX=N  Lost=0 (0.00%)  Seq=XXXX  0.0s ago
+  ACCEL / GYRO / MAG / H3LIS / BMP as expected
+  FSR:   lvl=0 pat=0x0
+```
+
+radio_recoveries should be 0 during an active session. Non-zero = peripheral genuinely hung mid-session.
+
+USB TX drops should be 0 in steady state at 1 ball × 250Hz. Non-zero drops indicate the main loop
+is taking >4ms per iteration. Primary cause: RTT output stalling (confirm SEGGER_RTT_CONFIG_DEFAULT_MODE = 0
+in sdk_config.h and that SEGGER_RTT_Conf.h uses #ifndef guards so the value is not overridden).
+
+---
+
+## PERFBOARD BUILD COMPONENTS
+
+### Purchased — DigiKey order (arrived)
+
+| Item | DigiKey # | Adafruit # | Notes |
+|------|-----------|------------|-------|
+| Adafruit FeatherWing Proto | 1528-1622-ND | 2884 | Wiring termination layer, stacks on Feather |
+| Feather Stacking Female Headers | — | 2886 | 12+16 pin set — required for 2884 to stack |
+| Bakelite Perfboard ×10 | 1528-2171-ND | 2670 | Scissors-cuttable sensor carriers |
+| M2.5 Nylon Standoff/Screw Kit | 1528-2339-ND | 3299 | Includes 5mm, 6mm, 8mm, 10mm, 12mm |
+| STEMMA QT 50mm cables ×5 | 1528-4399-ND | 4399 | JST SH 4-pin, prototype phase wiring |
+| Klein 11057 wire stripper | 1742-1270-ND | — | 22-32AWG |
+| Kapton tape 10mm | 1188-KAPTON-TAPE10MM-ND | — | Strain relief and battery retention |
+| ESD wrist strap | DKS-ESD-WRISTSTRAP-ND | — | Handle Feather and sensor boards safely |
+
+### To purchase locally
+
+| Item | Supplier | Product | Notes |
+|------|----------|---------|-------|
+| 30AWG silicone wire, 5 colours | Jaycar NZ | WH3026 | Black, red, green, yellow, white — 10m each |
+| Conformal coating | RS Components NZ | Electrolube AFA200 | Acrylic, aromatic-free, reworkable with IPA |
+| Double-sided foam tape | Hardware store | 3M 4008 or 4013 | ~1mm thick, battery retention |
+| Small steel ruler | Hardware store/stationery | — | For measuring/scoring Bakelite |
+
+### Already owned
+
+| Item | Notes |
+|------|-------|
+| Feather nRF52840 | |
+| 4517 LSM6DSOX + LIS3MDL (9DoF) | One physical board, two I2C devices |
+| H3LIS331 (Adafruit 4627) | |
+| BMP581 (Adafruit 5716) | |
+| LiPo 603450, 3.7V 1100mAh | Inspect for swelling. Charge fully before use. |
+| 330µF 25V electrolytic | Already on perfboard |
+| Adafruit 1608 Perma-Proto | Fallback sensor carrier if Bakelite approach fails |
+| Bubble wrap | Ball prototype casing |
+| Lead-free solder | |
+| Flux pen | |
 
 ---
 
 ## HARDWARE
 
 ### TX Ball
-- Adafruit Feather nRF52840
-- LSM6DSOX (accel + gyro, I2C 0x6A)
-- LIS3MDL (magnetometer, I2C 0x1C)
-- H3LIS331 (high-G accel, I2C 0x18)
-- BMP581 (pressure, I2C 0x46)
-- 100nF X7R ceramic decoupling cap on BMP581 VDD — required for reliable NVM load at power-on
-- 4× FSR (Phase 3, not yet wired)
+
+**Processor/radio:** Adafruit Feather nRF52840
+
+**Sensor boards (3 physical boards, 4 I2C devices)**
+- Adafruit 4517: LSM6DSOX (accel + gyro, I2C 0x6A) + LIS3MDL (magnetometer, I2C 0x1C)
+- Adafruit 4627: H3LIS331 (high-G accel, I2C 0x18)
+- Adafruit 5716: BMP581 (pressure, I2C 0x47)
+
+**Power**
+- LiPo battery: 3.7V 1100mAh, JST connector. MCP73831 charges via USB.
+  Inspect for swelling before use. Confirm JST polarity before connecting.
+- 330µF 25V electrolytic at Feather 3.3V/GND. Polarity confirmed.
+
+**Battery monitoring**
+- SAADC channel 0: AIN5 (P0.29), hardwired 150K/150K divider (always connected, no FET)
+- Conversion: adc_counts × 1758 / 1000 = millivolts
+- USB-only threshold: 1000mV. Full charge: ~4200mV.
+- Shutdown threshold: 3300mV (triggers emergency_shutdown)
+- Battery reads ~559mV when disconnected (floating pin — normal, below USB threshold)
+
+**Capacitors**
+- 330µF 25V electrolytic: one, at Feather 3.3V/GND near JST connector
+- 100nF per sensor: onboard on all Adafruit breakouts — no separate parts required
+
+**Other:** 4× FSR (Phase 3, not yet wired). TX power currently 0dBm (**revert to +8dBm before Phase 1.5 testing**).
+
+### Wiring — perfboard (prototype phase: STEMMA QT)
+
+**I2C:** SCL=P0.11, SDA=P0.12
+**STEMMA QT chain:** Feather (soldered cut cable) → 4517 → H3LIS331 → BMP581
+**I2C pull-ups:** none external required. Three boards onboard = ~3.3kΩ effective.
+**Address configuration:** all sensors use factory default addresses, no config pins needed.
+
+**Wire colour scheme (perfboard final build — Jaycar WH3026 30AWG):**
+- Red: 3.3V | Black: GND | Yellow: SCL | Green: SDA | White: misc/address/FSR
+- Note: green=SDA (not blue — Jaycar WH3026 has no blue). Different from breadboard scheme.
+
+**Power topology:** dedicated wire from 2884 3V3 strip to each sensor VCC;
+dedicated wire from 2884 GND strip to each sensor GND.
+
+**LED:** P1.15 (~1Hz toggle = normal; solid on = init failed; off = brownout loop)
+**FSR0–3 (Phase 3):** P0.03/04/05/28 (AIN1–4, SAADC channels 1–4)
+**SWD/J-Link post-assembly:** bubblewrap is removable for reprogramming.
 
 ### RX Station
-- Adafruit Feather nRF52840
-- USB to PC only — no sensors
-- Enumerates as COM14 on current PC (generic "USB Serial Device" — VID auto-detect
-  does not work; always pass COM14 explicitly to decoder)
+- Adafruit Feather nRF52840, USB to PC only
+- COM14 on current PC (pass explicitly to decoder — VID auto-detect unreliable)
 
-### Wiring (confirmed correct)
-- I2C: SCL=P0.11, SDA=P0.12, pullups present, bus ~12cm
-- H3LIS331: CS→3.3V (I2C mode), SDO→GND (fixes address at 0x18)
-- BMP581 (Adafruit breakout): SDO→GND = address 0x46. CS left unconnected for I2C.
-  Note: unlabelled pin between SCL/SDA on the breakout is SDO
-- Battery monitor: P0.31 (AIN7, SAADC channel 0, 12-bit)
-- LED: P1.15
-- FSR0-3 (Phase 3): P0.03/04/05/28 (AIN1-4, SAADC channels 1-4)
+### Stack architecture
+
+```
+Layer 1 (top):    Feather nRF52840 + 2884 FeatherWing Proto (stacked via 2886 headers)
+                  ↕ 10mm M2.5 nylon standoffs (spanning battery)
+                  Battery: LiPo 603450 (foam-taped to Feather underside)
+                  ↕ M2.5 standoffs (continuation)
+Layer 2 (middle): 4517 9DoF + H3LIS331 (on Bakelite carrier cut from 2670)
+                  ↕ 5mm M2.5 nylon standoffs
+Layer 3 (bottom): BMP581 (on Bakelite carrier cut from 2670)
+
+Bounding box: 50.8 × 34.0 × ~42mm
+```
 
 ---
 
@@ -94,15 +506,18 @@ Mitigation: test channels 20 and 80 if loss is consistently above 1%.
 ### Data flow
 ```
 Ball sensors (250Hz)
-  → I2C reads in main loop
+  → I2C reads in main loop (250kHz, ~2.1ms total)
   → 86-byte packet built (3 redundant samples)
   → 2.4GHz radio TX (2Mbps GFSK, channel 40)
   → RX Feather radio ISR
-  → memcpy to local buffer (IRQs off, ~1us)
+  → usb_serial_process() [drain TX_DONE from previous packet, clear s_tx_busy]
+  → memcpy to local buffer (RADIO IRQ masked, ~1us)
+  → usb_serial_send_framed_packet() [immediately after copy — minimum latency]
+  → packet_processor_process() [sequence tracking, raw sample store]
   → USB CDC → PC (89-byte framed packets)
       frame: [0xAA][0x55][86-byte radio_packet_t][XOR checksum]
   → C++ decoder → OSC/UDP → Pure Data → ASIO audio
-                → RTT (decoded sensor values, 1Hz)
+                → RTT (decoded sensor values, 1Hz — decoded on demand not on every packet)
 ```
 
 ### USB framing detail
@@ -115,8 +530,8 @@ Each USB frame is 89 bytes:
 ```
 The sync header locates boundaries. The checksum validates extraction —
 any false sync alignment produces a checksum mismatch and is discarded.
-The entire 89 bytes must be sent in a single `app_usbd_cdc_acm_write()` call
-to avoid partial-frame corruption. This requires CDC ACM TX buffer ≥ 89 bytes
+The entire 89 bytes must be sent in a single app_usbd_cdc_acm_write() call
+to avoid partial-frame corruption. This requires CDC ACM TX buffer >= 89 bytes
 (set APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256 in sdk_config.h).
 
 DTR must be asserted by the decoder after opening the COM port to trigger
@@ -128,29 +543,45 @@ stays false and no bytes are sent. SerialReader.cpp calls EscapeCommFunction(SET
 - OSC over UDP loopback: no bandwidth constraint, 32-bit float native
 - MIDI retained only for: impact note triggers, FSR contact transitions
 
+### Watchdog (TX)
+nRF52840 WDT, 500ms timeout. SLEEP=Run, HALT=Run. Cannot be stopped once started.
+Started after the 500ms LED flash in main(). WDT interrupt enabled (INTENSET.TIMEOUT,
+priority 7) — WDT_IRQHandler writes g_wdt_context to GPREGRET before reset.
+
+WDT feeds in main.c (8 sites):
+  1. First instruction — covers post-WDT-reset boot
+  1b. Immediately after 500ms startup delay — fresh window for sensors_init()
+  2. Before 500ms LED flash — sensors_init() may have consumed window from #1b
+  3. Inside LFCLK startup wait loop
+  4. Fix C retry block (two 1s feeds during 2s retry)
+  5. Inside indicate_error_fatal() — LED solid without WDT firing
+  6. Inside emergency_shutdown() — 2000ms blink > 500ms timeout
+
+WDT feeds in sensors.c:
+  7. init_bmp581() — at Step 1/4/5 delays and Step 6 retry loop
+  8a. twi_wait() timeout — before TASKS_STOP/recovery
+  8b. twi_wait() timeout — after EVENTS_STOPPED poll
+  8c. twi_wait() timeout — after nrf_drv_twi_uninit()
+
 ---
 
 ## PACKET SPECIFICATION (v1.0)
 
-Defined in `packet_spec.h` — identical copy in tx/ and rx/. The decoder has
-a separate C++ copy in decoder/MidiJugglingDecoder/ with static_assert instead
-of _Static_assert and scaling helpers added. If the on-air format changes,
-all three copies must be updated.
+Defined in packet_spec.h — identical copy in tx/ and rx/. Decoder has a C++ copy.
+If on-air format changes, all three copies must be updated.
 
-### Data packet: 86 bytes at 250Hz (on-air)
+### Data packet: 86 bytes at ~199Hz
 ```
 ball_id    uint8_t   Ball 1-8
 sequence   uint16_t  Wraps at 65535
 timestamp  uint16_t  RTC ticks since TX boot, wraps at ~65535 ticks (~66.0s)
 data_t0    27 bytes  Current sample
-data_t1    27 bytes  t-4ms
-data_t2    27 bytes  t-8ms
+data_t1    27 bytes  t-5ms
+data_t2    27 bytes  t-10ms
 ```
 
-Note on timestamp field: the field is named "milliseconds" for convenience but
-carries raw RTC ticks. RTC1 runs at 32768/33 = 992.97 Hz, so each tick is
-~1.007ms and the counter wraps at ~66.0s (not 65.5s). For Phase 2 t1/t2
-gap-fill interpolation, treat the field as ticks, not true milliseconds.
+Timestamp: raw RTC ticks, not ms. RTC1 at 992.97 Hz → each tick ~1.007ms, wraps ~66.0s.
+For Phase 2 t1/t2 gap-fill interpolation, treat the field as ticks.
 
 ### sensor_data_t: 27 bytes
 ```
@@ -169,12 +600,8 @@ pressure[3]          uint8_t  BMP581 24-bit LE, Pa = raw/64
 // Gyro:     raw / 32768.0 * 500.0 = dps
 // Mag:      raw / 6842.0 = gauss (+/-4 gauss range)
 // Pressure: uint32 = p[0] | (p[1]<<8) | (p[2]<<16); pa = uint32 / 64
-// Temp (status packet only): raw / 65536.0 = C; stored as int16 in 0.01C units
+// Temp:     raw / 65536.0 = C; stored as int16 in 0.01C units (status packet only)
 // H3LIS:    extract_h3lis_axis(packed) / 2048.0 * 400.0 = g
-
-// H3LIS decode — use extract_h3lis_axis() from packet_spec.h.
-// Do NOT use arithmetic right shift (implementation-defined in C/C++).
-// The helper uses unsigned shift + explicit sign extension from bit 11.
 uint8_t fsr_intensity = h3lis_x_fsr_level & 0x0F;
 ```
 
@@ -186,11 +613,8 @@ total_packets_sent (uint32), uptime_seconds (uint32)
 radio_timeouts (uint16), i2c_errors (uint16), reserved (uint8), checksum (uint8 XOR)
 ```
 
-Temperature field: SENSORS_TEMP_UNAVAILABLE (-32768) means BMP581 absent.
-Firmware stores 0 in status packet when BMP581 is unavailable to avoid displaying
--327.68°C. Decoders must use the SENSOR_BMP_OK bit in sensor_health to distinguish
-"0 degrees C" from "BMP absent" — the temperature field alone is ambiguous.
-Status packets are RTT-only and are never forwarded over USB.
+Temperature field: SENSORS_TEMP_UNAVAILABLE (-32768) means BMP581 absent; stored as 0.
+Status packets are RTT-only, never forwarded over USB.
 
 ---
 
@@ -198,12 +622,11 @@ Status packets are RTT-only and are never forwarded over USB.
 ```
 Mode:        2Mbps GFSK (Nrf_2Mbit)
 Channel:     40 (2440 MHz)
-TX Power:    +8 dBm
-Base addr:   0x12345678
-Prefix:      0xAB
-CRC:         24-bit, poly=0x00065B, init=0x555555
+TX Power:    currently 0dBm (**revert to +8dBm before Phase 1.5 testing**)
+Base addr:   0x12345678 | Prefix: 0xAB
+CRC:         24-bit, poly=0x00065B (Nordic proprietary — NOT IBM CRC-24 0x864CFB), init=0x555555
 Payload:     86 bytes fixed (STATLEN=86, no length field)
-Shortcuts:   READY→START, END→DISABLE, DISABLED→RXEN (RX auto-loop)
+Shortcuts:   READY->START, END->DISABLE, DISABLED->RXEN (RX auto-loop)
 ```
 
 ---
@@ -211,59 +634,45 @@ Shortcuts:   READY→START, END→DISABLE, DISABLED→RXEN (RX auto-loop)
 ## SENSOR CONFIGURATION
 
 ### LSM6DSOX
-- CTRL1_XL = 0x66 (LSM6_CTRL1_XL_VAL): 416Hz ODR, +/-16g
-- CTRL2_G  = 0x64 (LSM6_CTRL2_G_VAL): 416Hz ODR, +/-500dps
-  - **0x68 = +/-1000dps — do NOT use. Was a silent bug for multiple sessions.**
-- CTRL3_C  = 0x44 (LSM6_CTRL3_C_VAL): BDU enabled, IF_INC enabled
-- Auto-increment on I2C burst reads (no special flag needed)
+- CTRL1_XL=0x66: 416Hz, +/-16g, LPF2_XL_EN=1
+- CTRL2_G=0x64: 416Hz, +/-500dps (**0x68 = +/-1000dps — do NOT use**)
+- CTRL3_C=0x44: BDU enabled, IF_INC enabled
 
 ### LIS3MDL
-- CTRL_REG1 = 0xFE (LIS3_CTRL_REG1_VAL): ultra-high perf XY, 155Hz (FAST_ODR=1), temp enabled
-  - Changed from 0xFC (80Hz). FAST_ODR is bit 1; setting it with OM=11 (UHP) enables 155Hz.
-  - **0xFC = 80Hz — do NOT use.**
-- CTRL_REG2 = 0x00: +/-4 gauss
-- CTRL_REG3 = 0x00: continuous conversion
-- CTRL_REG4 = 0x0C: ultra-high perf Z, little-endian
-- **Requires | 0x80 on register address for multi-byte I2C burst reads**
-- Effective output rate: 155Hz. At 250Hz TX polling, ~every 1.6 packets has fresh mag data
-- Duplicate mag readings in packet stream are normal and harmless
+- CTRL_REG1=0xFE: UHP, 155Hz FAST_ODR (**0xFC = 80Hz — do NOT use**)
+- CTRL_REG2=0x00: +/-4 gauss | CTRL_REG3=0x00: continuous | CTRL_REG4=0x0C: UHP Z, LE
+- **Requires | 0x80 on register address for multi-byte burst reads**
 
 ### H3LIS331
-- CTRL_REG1 = 0x37 (H3LIS_CTRL_REG1_VAL): normal mode, 400Hz, all axes
-- CTRL_REG4 = 0xB0 (H3LIS_CTRL_REG4_VAL): BDU enabled, +/-400g
-- **Requires | 0x80 on register address for multi-byte I2C burst reads**
-- **No register readback verification in sensors_init()** (unlike radio_init and BMP581).
-  A silent CTRL_REG4 write failure sets a wrong range without detection.
-  Low risk on stable hardware; consider adding readback checks before Phase 2 extended testing.
+- CTRL_REG1=0x37: normal mode, 400Hz, all axes
+- CTRL_REG4=0xB0: BDU enabled, +/-400g
+- **Requires | 0x80 on register address for multi-byte burst reads**
 
 ### BMP581
-- On-chip compensation — outputs pre-compensated data directly
-- Pa = raw_register_value / 64 (no polynomial, no NVM reads needed)
-- **OSR_CONFIG = 0x52 (BMP_OSR_CONFIG_VAL)**: pressure x4, temp x4 oversampling
-  - Bit 6 (PRESS_EN) MUST be 1. Without it pressure registers return 0x7F7F7F.
-  - **0x12 (PRESS_EN=0) was the original value — confirmed broken on hardware. Do NOT use.**
-- ODR_CONFIG = 0x11 (BMP_ODR_CONFIG_VAL): normal mode ~218Hz
-- Temp: raw / 65536 = C; firmware stores as int16 in 0.01C units
-- NVM error flag (STATUS bit 1) is observed on known-good Adafruit units.
-  It does not prevent correct operation — do not treat as fatal.
-- Decoupling cap (100nF) required on VDD for reliable NVM load at power-on.
-- Register readback verified in init_bmp581() after writing OSR_CONFIG and ODR_CONFIG.
+- **OSR_CONFIG=0x52**: PRESS_EN=1, OSR_P=x4, OSR_T=x4 (**0x12=PRESS_EN=0 — causes 0x7F7F7F. Do NOT use.**)
+- ODR_CONFIG=0x11: normal mode ~218Hz
+- Pa = raw_register_value / 64 (on-chip compensation)
+- NVM error flag normal on Adafruit units. Step 6 data-ready poll always times out — normal.
 
 ### SAADC
-- Channel 0: battery (P0.31 AIN7, 12-bit, owned by main.c)
-- Channels 1-4: FSR0-3 (configured but disabled until Phase 3 wiring)
-- **FSR reads must save/restore 12-bit resolution — FSR calibration is 10-bit**
-- FSR_CONTACT_THRESHOLD = 80, intensity >> 6 scaling: calibrated for 10-bit ADC
-- **Phase 3 SAADC scan layout:** CH[0] (battery) remains configured during FSR reads.
-  SAADC scans CH[0..4] in order; fsr_read() uses MAXCNT=5 and discards adc_values[0]
-  (battery). FSR0..FSR3 are in adc_values[1..4]. Do NOT change MAXCNT to 4 — that
-  drops FSR3 and maps the battery sample into FSR0's slot.
+- Channel 0: battery (P0.29 AIN5, 12-bit, hardwired 150K/150K divider)
+- Channels 1-4: FSR0-3 (configured but disabled until Phase 3)
+- Phase 3 scan: MAXCNT=5, discard adc_values[0] (battery). Do NOT use MAXCNT=4.
+- saadc_stop_and_wait() tight loop: 100000-iteration loop with no delay inside — runs
+  ~10–15ms worst case. Harmless in Phase 2, but add a WDT feed before Phase 3 when SAADC
+  is used more heavily.
 
-### runtime_sensor_status behavior
-SENSOR_LSM6_OK is cleared on any single I2C read failure during sensors_read()
-(gyro read or accel read), even if the other succeeded. A transient I2C blip
-therefore appears as "sensor failed" in the status packet. This is known behavior,
-not a bug. Status packets include i2c_errors for correlation.
+---
+
+## OSC ADDRESS SPACE (Phase 1.5, stub implemented)
+```
+/ball/N/accel    [x y z] g       (+/-16g)
+/ball/N/gyro     [x y z] dps     (+/-500dps)
+/ball/N/mag      [x y z] gauss   (+/-4 gauss)
+/ball/N/h3lis    [x y z] g       (+/-400g)
+/ball/N/pressure float Pa
+/ball/N/fsr      intensity(int 0-15)  pattern(int bitmask)
+```
 
 ---
 
@@ -272,204 +681,17 @@ not a bug. Status packets include i2c_errors for correlation.
 ### Location
 ```
 C:\Projects\MIDI-Juggling-Balls\decoder\MidiJugglingDecoder\
-  MidiJugglingDecoder.sln
-  MidiJugglingDecoder.vcxproj
-  main.cpp
-  SerialReader.h
-  SerialReader.cpp
-  packet_spec.h        <- C++ version, differs from embedded: static_assert,
-                          scaling helpers (accel_to_g, gyro_to_dps etc.)
+  MidiJugglingDecoder.sln / .vcxproj / main.cpp
+  SerialReader.h / SerialReader.cpp
+  packet_spec.h   <- C++ version: static_assert, scaling helpers
 ```
 
-### Running the decoder
+### Running
 ```cmd
 cd C:\Projects\MIDI-Juggling-Balls\decoder\MidiJugglingDecoder\Debug
 MidiJugglingDecoder.exe
 ```
-Auto-detect now works via SERIALCOMM registry fallback: if VID 0x239A is not found (Feather
-enumerates as generic USB Serial on this machine), it falls back to the only active COM port
-(COM14). Prints a warning when using the fallback. If multiple COM ports are active, it lists
-them and exits — pass the port explicitly in that case: `MidiJugglingDecoder.exe COM14`.
-
-### Decoder architecture
-- `SerialReader`: background thread, ReadFile loop, 256-byte read chunks
-- Accumulation buffer with sync-header + checksum framing
-- Finds 0xAA 0x55 sync, extracts 86-byte payload, verifies XOR checksum
-- Checksum mismatch = false sync from payload data = discard + resync
-- ball_id sanity check (1-8) as belt-and-suspenders after checksum
-- `TryGetPacket()`: non-blocking, consumer thread safe
-- `main.cpp`: sequence gap validation (gap ≥ 500 = false sync, discard)
-- Stats every 5 seconds: bytes, packets, resyncs, per-ball loss, false_syncs
-- OSC output: stubbed, implement OscSender after framing confirmed clean
-
-### OSC address space (Phase 1.5, stub implemented)
-```
-/ball/N/accel    [x y z] g       (+/-16g)
-/ball/N/gyro     [x y z] dps     (+/-500dps)
-/ball/N/mag      [x y z] gauss   (+/-4 gauss, ~31Hz effective)
-/ball/N/h3lis    [x y z] g       (+/-400g — not +/-16g scale)
-/ball/N/pressure float Pa
-/ball/N/fsr      intensity(int 0-15)  pattern(int bitmask)
-```
-
-MIDI (discrete events, Phase 2):
-- Ball N → MIDI Channel N (via loopMIDI)
-- Impact (H3LIS threshold) → Note On/Off
-- FSR contact transitions → CC
-
----
-
-## TX RTT VALIDATION CHECKLIST (no RX needed)
-
-After flashing TX, connect J-Link and open RTT terminal. Expected startup:
-```
-=== Juggling Ball TX (Ball 1) v3.15 ===
-Packet sizes:
-  radio_packet_t: 86 (expect 86)      <- must match
-  sensor_data_t:  27 (expect 27)      <- must match
-  status_packet_t:26 (expect 26)      <- must match
-LSM6DSOX at 0x6A
-LIS3MDL at 0x1C
-H3LIS331 at 0x18
-BMP581 at 0x46 (CHIP_ID=0x50)
-  OSR_CONFIG readback=0x52 (expect 0x52)
-=== BMP581 OK ===
-Battery: XXXX mV (USB-only mode)
-Radio OK
-Transmitting at 250Hz (4ms). Status every 120s.
-```
-
-Every second in the loop:
-```
-ACCEL:  ~0   ~2048   ~0     <- one axis ~2048 (1g at +/-16g), others near 0
-GYRO:   ~0   ~0      ~0     <- near zero at rest
-MAG:    stable non-zero values, change with rotation
-H3LIS:  small values (-5 to +10), spike on impact
-BMP:    ~101325 Pa (102000-103000 Pa typical indoors Wellington NZ)
-FSR:    lvl=0 pat=0x0
-TX[0..9]: OK             <- first 10 transmissions printed
-DEBUG: loop=250 ... diff=0   <- diff must be 0 by loop 250
-```
-
----
-
-## RX RTT VALIDATION CHECKLIST
-
-After flashing RX, power on TX. Both must be running simultaneously.
-Note: TX does not need J-Link connected to transmit — USB power is sufficient.
-Disconnecting J-Link from TX triggers a reset; wait for TX to reinitialise.
-
-Expected RX output:
-```
-=== Juggling Ball RX v1.5 ===
-  radio_packet_t: 86 (expect 86)
-  sensor_data_t:  27 (expect 27)
-  USB frame:      89 bytes (2 sync + 86 payload + 1 checksum)
-Channel: 40 (2440 MHz)
-Radio state: 0x03 (expect 0x03 = RX)
-Waiting for packets...
-
-*** Ball 1: first packet seq=XXXX ***   <- appears when TX powered on
-
---- RX Stats (every second) ---
-Radio: N OK  0 CRC-fail  N END events
-Ball 1: RX=N  Lost=0 (0.00%)  Seq=XXXX
-  ACCEL:   ~0  ~2048   ~0
-  GYRO:    ~0    ~0    ~0
-  MAG:   stable non-zero
-  H3LIS: small values
-  BMP:   ~101325 Pa
-  FSR:   lvl=0 pat=0x0
-```
-
-Acceptable benchtop results:
-- Packet loss <1% after first ~5 seconds of RF settling
-- CRC errors <0.2%
-- Early loss burst on first connection is normal
-
----
-
-## BUGS FIXED (all sessions)
-
-| Bug | File | Impact |
-|-----|------|--------|
-| LIS3MDL burst read missing \| 0x80 | sensors.c | All mag data was X-low byte x6 |
-| CTRL2_G = 0x68 (+/-1000dps) | sensors.c | Wrong gyro range, wrong RX scaling |
-| LSM6DSOX BDU not enabled | sensors.c | Split-sample reads possible at ~1% rate |
-| runtime_sensor_status = 0x0F | sensors.c | Falsely reported all sensors OK before detection |
-| init_bmp581 status uninitialised | sensors.c | UB if I2C failed before first read |
-| BMP581 STATUS nvm_rdy bit inverted | sensors.c | "ready" printed as "BUSY" |
-| **BMP581 OSR_CONFIG = 0x12 (PRESS_EN=0)** | sensors.c | **Pressure registers stuck at 0x7F7F7F. Fix: 0x52** |
-| BMP pressure display not /64 | main.c (TX) | Showed ~6.5M instead of ~101325 |
-| next_tx_time wrong type (uint32_t) | main.c (TX) | Timing arithmetic implementation-defined |
-| Negative ADC cast unguarded | main.c (TX) | Wrap-around battery voltage on noise |
-| LED toggled at 125Hz | main.c (TX) | Appeared constantly on |
-| status_packet_t size wrong (22→26) | main.c (TX) | Wrong struct size in comment |
-| TX rate 125Hz → 250Hz | main.c (TX) | Halved sensor avg-wait latency |
-| Timing resync only on positive diff | main.c (TX) | Loop ran at ~2x rate after I2C stall |
-| sensors_read_temperature returns 0 on fail | sensors.c | 0C ambiguous as error sentinel |
-| H3LIS decode uses signed right shift | packet_processor.c | Implementation-defined in C |
-| radio_init returns frequency readback only | radio_rx.c | Meaningless check |
-| RX packet size 98 vs TX 86 | radio_rx.h | Would never receive any packets |
-| RX sensors.h had old sensor_data_t | radio_rx.h | Struct mismatch between sides |
-| Packet contract split across files | both sides | Could silently drift — unified in packet_spec.h |
-| __attribute__((packed)) mixed with #pragma pack | packet_spec.h | Inconsistent; MSVC incompatible |
-| RX HFCLK via direct register + nrf_drv_clock | main.c (RX) | Bypassed driver reference count |
-| usb_serial.h claimed hot-plug support | usb_serial.h | Header contradicted implementation |
-| Frequency display "2%03d" format | main.c (RX) | Printed 22440 MHz instead of 2440 MHz |
-| radio_get_stats() non-atomic volatile reads | radio_rx.c | Could observe partially updated stats |
-| Packet loss % overflow for long sessions | packet_processor.c | uint32 overflow after ~57min at 1% loss |
-| Gap heuristic threshold 1000 undocumented | packet_processor.c | Reduced to 500, documented |
-| radio_rx.h 125Hz comment | radio_rx.h | Stale — corrected to 250Hz/4ms |
-| usb_serial_send_packet() three separate writes | usb_serial.c | Partial frame on TX buffer busy — replaced with single atomic 89-byte write |
-| radio_init power cycle delay 10us (TX) | main.c (TX) | Too short for peripheral bus stabilisation; caused STATE readback failures and recovery cascade |
-| transmit_packet missing __DMB() before TASKS_TXEN (TX) | main.c (TX) | Cortex-M4 write buffer could hold pending stores; DMA might read stale packet data |
-| recover_radio fixed 1ms sleep (TX) | main.c (TX) | Insufficient wait for DISABLED; caused always-fail recovery loop |
-| indicate_error_radio() in recover_radio (TX) | main.c (TX) | 3s blocking per call cascaded into indefinite loop of blockages |
-| **usb_serial_send_framed_packet frame on stack (RX)** | usb_serial.c | **Root cause of 99% decoder loss. DMA reads freed stack memory for last 25 bytes (second USB bulk packet). Fix: static frame buffer + TX_DONE guard** |
-| USB framing constants defined in 4 places | main.c (RX), usb_serial.c, SerialReader.cpp | Could silently drift on change. Fix: USB_SYNC_BYTE_0/1 and USB_FRAME_SIZE centralised in packet_spec.h |
-| usb_serial_send_text() missing s_tx_busy guard | usb_serial.c | Could corrupt ongoing DMA transfer if called while framed packet in flight |
-| SerialReader::Close() races on ReadFile HANDLE | SerialReader.cpp | CloseHandle called while ReadFile may still hold it. Fix: CancelSynchronousIo before CloseHandle |
-| SerialReader::ProcessBytes() O(n) erase per resync byte | SerialReader.cpp | Quadratic in sustained resync storm. Fix: read_pos index, single erase at end |
-| SerialReader packet queue unbounded | SerialReader.cpp | Unbounded growth under backlog. Fix: MAX_QUEUE_DEPTH=500, drop oldest on overflow |
-| RX timing.c LFCLK via direct register writes | timing.c | Bypassed nrf_drv_clock reference counting, contradicting RX design contract. Fix: nrf_drv_clock_lfclk_request() |
-| LIS3MDL ODR 80Hz (CTRL_REG1=0xFC) | sensors.c | Sensor refreshed only every ~3rd packet at 250Hz TX rate. Fix: 0xFE (FAST_ODR=1) = 155Hz |
-| APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 64 (RX) | sdk_config.h | SDK default 64 < 89-byte frame; changed to 256 (necessary but not sufficient — stack bug was the primary cause) |
-| AutoDetectPort GUID_DEVCLASS_PORTS only (PC) | SerialReader.cpp | Failed when Feather enumerates as generic USB Serial; added DIGCF_ALLCLASSES pass + SERIALCOMM registry fallback |
-| usb_serial_send_framed_packet return value discarded (RX) | main.c (RX) | USB TX drops invisible; added usb_tx_drop_count with RTT output |
-| usb_serial.c CDC ACM buffer size uninstrumented (RX) | usb_serial.c | No runtime confirmation of compiled value; added RTT print (since removed once confirmed) |
-| USB CDC TX buffer too small for 89-byte frame | sdk_config.h | **FIXED** — APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256 |
-| SEGGER_RTT_CONFIG_DEFAULT_MODE undefined in sdk_config.h (TX) | sdk_config.h (TX) | SEGGER_RTT_Conf.h used symbol with no fallback; compiler resolved to 0 by luck. Fix: full SEGGER_RTT_CONFIG section added to sdk_config.h |
-| read_battery_voltage() bare polling loops (TX) | main.c (TX) | No timeout guards; SAADC hang would block indefinitely. Fix: 100000-iteration countdown, return 0 on timeout |
-| Status interval check used 32-bit divide at 250Hz (TX) | main.c (TX) | get_uptime_seconds() divided COUNTER/1000 every loop. Fix: STATUS_INTERVAL_TICKS direct RTC comparison |
-| H3LIS331 burst-read fallback unbounded (TX) | sensors.c (TX) | On burst failure, 6 single-byte reads added ~1.5ms unpredictable latency at tightest timing point. Fix: suppress fallback after 3 consecutive failures, write zeros instead |
-| clear_bus_init = false in TWI config (TX) | sensors.c (TX) | SDA stuck low after abnormal reset would cause sensors_init() to fail on next boot. Fix: true — driver clocks bus free at init |
-| h3lis_consecutive_failures uint8_t wrap (TX) | sensors.c (TX) | Counter wraps to 0 at 255 (~1s at 250Hz), re-enabling fallback reads and defeating suppression. Fix: cap increment at SUPPRESS_AFTER+1 |
-| sensors_read_temperature sign extension UB (TX) | sensors.c (TX) | (int32_t)0xFF000000 exceeds INT_MAX; implementation-defined in C99/C11. Fix: ~(int32_t)0x00FFFFFF (well-defined, identical result) |
-| memset(&h3lis_x_fsr_level, 0, 6) fragile (TX) | sensors.c (TX) | Relies on three H3LIS fields being contiguous at exact offset; silent breakage if struct changes. Fix: explicit per-field assignment |
-| fsr_read() C block comment guard (TX) | sensors.c (TX) | Partial uncomment could activate code without removing early return. Fix: #if 0 / #endif with explicit removal instruction |
-| Sensor config register values inline magic bytes (TX) | sensors.c (TX) | Range/ODR changes require byte reconstruction; previous 0x68/0x64 confusion caused multi-session bug. Fix: named constants (LSM6_CTRL2_G_VAL etc.) |
-| get_uptime_seconds() divide by 1000 (TX) | main.c (TX) | RTC1 at 993Hz not 1000Hz; uptime read 0.71% fast (~12.8s/30min). Fix: divide by RTC1_TICKS_PER_SEC=993 |
-| timing_init() delay uncommented (TX) | main.c (TX) | 10ms delay purpose unclear; could be deleted by mistake. Fix: comment added explaining counter advance before first get_timestamp_ms() call |
-| BMP_ODR_CONFIG_VAL comment said PRESS_EN=1 (TX) | sensors.c (TX) | PRESS_EN is in OSR_CONFIG (0x36), not ODR_CONFIG (0x37). Wrong label on wrong register; dangerous given PRESS_EN debugging history. Fix: corrected comment |
-| init_bmp581() readback printed but not checked (TX) | sensors.c (TX) | Silent OSR_CONFIG write failure would leave PRESS_EN=0; init_bmp581() still returned true. Fix: compare readback, return false on mismatch — consistent with radio_init() discipline |
-| SENSOR_LSM6_OK not set on accel read success (TX) | sensors.c (TX) | Gyro success set the bit; accel success did not. Fragile to read-order changes. Fix: set SENSOR_LSM6_OK in both success paths |
-| Raw byte assembly `(int16_t)(raw[0] \| (raw[1]<<8))` (TX) | sensors.c (TX) | Implementation-defined in C99/C11 when raw[1]>=128 — implicit int promotion shifts into sign bit. Fix applied in v3.11: `(int16_t)((uint16_t)raw[0] \| ((uint16_t)raw[1]<<8))` at all 12 sites (gyro/accel/mag/H3LIS). No behaviour change on GCC/Cortex-M4. |
-| sensors_test() never called (TX) | main.c (TX) | Dead public API — post-init WHO_AM_I re-check existed but was never invoked. Fix: called after sensors_init() succeeds; required sensor failure is fatal |
-| CRC_POLYNOMIAL comment "IBM CRC-24" wrong (packet_spec.h) | tx\, rx\, decoder\ packet_spec.h | 0x00065B is Nordic nRF proprietary CRC-24, not IBM CRC-24 (0x864CFB). Wrong label would cause independent CRC implementation to accept zero packets. Fix: corrected to "Nordic nRF proprietary radio CRC-24" |
-| timestamp comment "milliseconds, 65.5s" stale (packet_spec.h) | tx\, rx\, decoder\ packet_spec.h | RTC1 runs at 992.97Hz; field carries ticks not ms; wrap is ~66.0s not 65.5s. Fix: all three copies updated with ticks annotation and Phase 2 interpolation note |
-| stdbool.h / cstdbool unused includes (packet_spec.h) | tx\rx\ packet_spec.h, decoder\ packet_spec.h | bool not used in either version of the file. cstdbool deprecated in C++17 and removed in C++20. Fix: removed from both copies |
-| DecodedPacket::timestamp_ms field name (decoder) | main.cpp | Field named _ms, printed as "ms"; carries RTC ticks. Fix: renamed timestamp_ticks, printf updated |
-| Ctrl+C calls ExitProcess — no clean shutdown (decoder) | main.cpp | SerialReader destructor never ran; reader thread killed mid-operation; COM port not cleanly released. Fix: SetConsoleCtrlHandler sets g_running=false; main loop exits normally; destructor runs |
-| resync_events counter meaning undocumented (decoder) | main.cpp | Counter increments per byte advanced past, not per dropped packet. A single misalignment increments it many times; misleading in stats. Fix: label changed to resync_events with clarifying note in output |
-| RegQueryValueExA return value unchecked (decoder) | SerialReader.cpp | Failure silently left portName zero-initialised; device skipped without knowing why. Fix: check return value, continue on failure |
-| radio_init PREFIX0 not in readback (TX) | main.c (TX) | PREFIX0 mismatch causes same symptom as wrong CRCPOLY — silent dead link, no error on either side. BASE0 was verified but PREFIX0 was not. Fix: added to readback verification set in radio_init() |
-| fsr_read Phase 3 SAADC scan layout wrong (TX) | sensors.c (TX) | CH[0] (battery) configured by battery_init(); SAADC scans CH[0..4] in order. MAXCNT=4 captured CH[0..3]: adc_values[0] was battery (not FSR0), FSR3 (CH4) never sampled. Fix: MAXCNT=5, discard adc_values[0], read FSR0..FSR3 from adc_values[1..4] |
-| fsr_read Phase 3 SAADC timeout cleanup incomplete (TX) | sensors.c (TX) | STARTED timeout returned without issuing TASKS_STOP (SAADC left running); END timeout same; STOPPED timeout returned without clearing EVENTS_STOPPED (stale event causes subsequent saadc_stop_and_wait() to return immediately). Fix: all three paths stop cleanly; EVENTS_STOPPED cleared unconditionally |
-| Temperature RTT display sign lost for sub-zero fractions (TX) | main.c (TX) | `s.temperature/100` truncates toward zero; values in (−100..0) produce 0, silently dropping the minus sign. e.g. −0.50°C printed as "0.50 C". Fix: sign prefix printed separately using `s.temperature < 0 ? "-" : ""`; magnitude printed as `abs(s.temperature)/100` and `abs(s.temperature)%100`. Applies to both status log and emergency shutdown log. (v3.13) |
-| prepare_packet() comment claimed sequence set before blocking work (TX) | main.c (TX) | Comment said "sequence is set before any blocking work" — false; prepare_packet() runs after sensors_read() completes. Misleading for Phase 2 gap-fill implementation. Fix: corrected to "sequence is monotonically increasing and immune to I2C timing jitter". (v3.13) |
-| TX_INTERVAL_MS named with _MS suffix (TX) | main.c (TX) | Constant holds a tick count; _MS suffix re-introduced the class of confusion the v3.6 rename campaign (current_time_ms, get_timestamp_ms) was meant to eliminate. Fix: renamed TX_INTERVAL_TICKS. No functional change. (v3.15) |
-| Timing wrap cast `(int16_t)(next_tx_time - current_ticks)` (TX) | main.c (TX) | Both operands uint16_t; promoted to 32-bit int before subtraction; direct cast to int16_t when result outside [−32768, 32767] is implementation-defined in C99/C11. Fix: intermediate (uint16_t) cast inserted at both sites (debug diff and timing control). Same class as 12-site fix in sensors.c v3.11. No behaviour change on GCC/Cortex-M4. (v3.15) |
+Auto-detect via SERIALCOMM registry. Falls back to COM14 if only one active port.
 
 ---
 
@@ -484,8 +706,8 @@ TX: C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_tx\pca10056\blank\s
 RX: C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_rx_feather\pca10056\blank\ses\
 ```
 
-IMPORTANT: TX directory is `juggling_ball_tx` — NOT `juggling_ball_tx_feather`.
-The RX directory IS `juggling_ball_rx_feather`. These are different.
+IMPORTANT: TX directory is juggling_ball_tx — NOT juggling_ball_tx_feather.
+The RX directory IS juggling_ball_rx_feather. These are different.
 
 ### Git repo structure
 
@@ -495,28 +717,11 @@ C:\Projects\MIDI-Juggling-Balls\
 ├── rx\       main.c  radio_rx.c  radio_rx.h  packet_processor.c  packet_processor.h
 │             timing.c  timing.h  usb_serial.c  usb_serial.h  packet_spec.h  sdk_config.h
 ├── decoder\
-│   ├── .gitignore   (excludes Debug/ Release/ x64/ .vs/ *.user)
 │   └── MidiJugglingDecoder\
 │         MidiJugglingDecoder.sln  MidiJugglingDecoder.vcxproj
 │         main.cpp  SerialReader.h  SerialReader.cpp  packet_spec.h
 └── docs\     project_reference.md  hardware_reference.md
 ```
-
-The decoder VS2019 project lives inside the repo at:
-`C:\Projects\MIDI-Juggling-Balls\decoder\MidiJugglingDecoder\`
-The DECODER path variable and the repo decoder path are the same location.
-Do not copy decoder files — they are already in the repo. Only copy TX and RX from SDK.
-
-### packet_spec.h — three copies, intentionally different
-
-```
-tx\packet_spec.h              On-air contract, C, _Static_assert
-rx\packet_spec.h              Must be byte-identical to tx\ copy — fc checks this
-decoder\...\packet_spec.h     C++ version: static_assert, constexpr, scaling helpers added
-```
-
-The session commit routine fc-checks tx\ vs rx\ only. The decoder copy is
-intentionally different (C++ syntax) and is not checked automatically.
 
 ### Full commit routine (end of each session)
 
@@ -532,7 +737,7 @@ copy /Y %TX_SDK%\sensors.h     tx\
 copy /Y %TX_SDK%\packet_spec.h tx\
 copy /Y C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_tx\pca10056\blank\config\sdk_config.h tx\
 
-:: Copy RX files from SDK into repo
+:: Copy RX files from SDK into repo (only if RX changed this session)
 copy /Y %RX_SDK%\main.c              rx\
 copy /Y %RX_SDK%\radio_rx.c          rx\
 copy /Y %RX_SDK%\radio_rx.h          rx\
@@ -545,244 +750,76 @@ copy /Y %RX_SDK%\usb_serial.h        rx\
 copy /Y %RX_SDK%\packet_spec.h       rx\
 copy /Y %RX_SDK%\sdk_config.h        rx\
 
-:: Decoder files are already in the repo — no copy needed
-:: docs\project_reference.md is already in the repo — copy from Downloads if updated:
-:: copy /Y "C:\Users\Martin\Downloads\project_reference.md" docs\
-
 :: Verify packet_spec.h is identical TX vs RX
 fc tx\packet_spec.h rx\packet_spec.h
 
 :: Stage, review, commit
-git add tx\ rx\ decoder\ docs\
+git add tx\ rx\ docs\
 git status
-git commit -m "description"
+git commit -m "<version string>: <summary of changes>"
 git push
 ```
 
-**sdk_config.h is version-controlled** — contains APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256.
-Must be committed with any firmware changes.
-
-**packet_spec.h must be identical in tx\ and rx\ at all times.**
-
 ---
 
-## PHASE PLAN
+## SESSION REMINDERS
 
-### Phase 1 (complete): Single ball, full data flow
-- All sensors validated on TX RTT
-- End-to-end radio validated: TX → RX → RTT, ~0.7% packet loss benchtop
-- USB CDC confirmed: 89-byte framed packets to PC
-- C++ decoder confirmed: clean framing, 0 resyncs, loss matches RF loss
+- TX is juggling_ball_tx. RX is juggling_ball_rx_feather. They differ.
+- TWI0_USE_EASY_DMA=1 in TX sdk_config.h is required. Without it the event handler is
+  silently ignored and all transactions block.
+- packet_spec.h must be identical in tx\ and rx\ at all times.
+- sdk_config.h is version-controlled — commit with firmware changes.
+- APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE=256 in RX sdk_config.h (default 64 too small).
+- LIS3MDL and H3LIS331 burst reads need | 0x80. LSM6DSOX does not.
+- LSM6 CTRL2_G=0x64 (+/-500dps). 0x68=+/-1000dps. Use the named constant.
+- BMP581 OSR_CONFIG must be 0x52 (PRESS_EN=1). 0x12 disables pressure.
+- BMP581 NVM error is normal. Step 6 data-ready timeout is normal on this unit.
+- H3LIS decode: use extract_h3lis_axis(). Do not use arithmetic right shift.
+- get_rtc_ticks() returns uint16_t on TX, uint32_t on RX (different implementations).
+- Battery on TX: AIN5 (P0.29), 150K/150K hardwired divider, no enable FET or GPIO.
+  Reads ~559mV when disconnected (floating) — below 1000mV USB-only threshold, normal.
+- I2C now at 250kHz (was 400kHz). TX rate now ~199Hz (TX_INTERVAL_TICKS=5, was 4/250Hz). If TX rate falls below ~199Hz check DEBUG diff values.
+- Disconnecting J-Link from TX resets it. Allow 2-3s reinit before expecting RX packets.
+- WDT feeds in main.c and sensors.c are required and must not be removed.
+- WDT HALT=Run. WDT interrupt enabled (priority 7). Do not revert either.
+- CRC_POLYNOMIAL=0x00065B is Nordic nRF proprietary, not IBM CRC-24 (0x864CFB).
+- TX power currently 0dBm. **Revert to +8dBm before Phase 1.5 testing** (was reduced during dropout investigation).
+- USB throughput ceiling: 89-byte frames. At ~199Hz: 1 ball = 17,711 bytes/sec (28%), 2 balls = 35,422 (55%), 3 balls = 53,133 (83%). Ceiling resolved for 3-ball operation. Ring buffer still required for Phase 2 multi-ball handling.
+- Direct GND wire in place: BMP581 GND → Feather GND (28–30 AWG stranded). Do not remove.
+- If dropout recurs: add direct GND wires from LSM6DSOX and LIS3MDL to Feather GND (full star topology). Not currently needed.
+- CLOCK_CONFIG_LF_SRC = 1 in both TX and RX sdk_config.h. RX: required (SDK clock module
+  controls LFCLK; without it the SDK defaults to RC oscillator, making all timing constants
+  wrong). TX: added for correctness; timing_init() overrides the SDK's LFCLK selection
+  unconditionally, but having the SDK start with Xtal removes the dependency on that override.
+- HFCLK_STARTUP_TIMEOUT_MS = 100ms in TX main.c. nRF52840 HFXO can take up to 6ms; the
+  previous value of 10ms left <4ms margin. Same bug was previously fixed on RX.
+- SEGGER_RTT_CONFIG_DEFAULT_MODE = 0 in RX sdk_config.h. Verify SEGGER_RTT_Conf.h in the
+  SDK uses #ifndef guards so this value is not overridden. Blocking RTT mode causes packet loss.
+- SEGGER_RTT_CONFIG_BUFFER_SIZE_UP = 2048 in RX sdk_config.h (sufficient for 8 balls).
+- usb_serial_process() must be called before usb_serial_send_framed_packet() in the RX main
+  loop. If called after, TX_DONE is not processed before the next send attempt and every
+  other packet is dropped via the s_tx_busy guard.
+- DecodedPacket::timestamp_ticks carries RTC ticks, not milliseconds.
+- SDK not in git. nRF5 SDK v17.1.0. SES .emProject not in git (absolute paths).
+- VS2019 .sln and .vcxproj ARE in git.
+- ESD wrist strap: wear when handling Feather and sensor boards.
+- Conformal coating (AFA200): mask USB-C, JST, test pads. Reworkable with IPA.
+- Battery: inspect for swelling. Confirm JST polarity. Charge fully before use.
+- Three physical sensor boards, four I2C devices. Wire colours: R=3V3, Blk=GND,
+  Yel=SCL, Grn=SDA (NOT blue — Jaycar WH3026 has no blue).
+- saadc_stop_and_wait() tight loop has no WDT feed — add one before Phase 3 SAADC use.
 
-### Phase 1.5 (in progress): C++ decoder → OSC → Pure Data
-- C++ decoder receiving clean data ✓
-- USB framing confirmed end-to-end ✓
-- **NEXT: implement OSC output (stub in place)**
-- Connect Pure Data patch, ASIO output
-- Success criterion: move ball, hear sensor data drive audio in real time
+### LED states (TX)
+- LED blinking ~1Hz: normal operation
+- LED on solid: indicate_error_fatal() reached — init failed after reset
+- LED off: genuine power-on reset loop (brownout) — firmware never starts
 
-### Phase 2: Sensor-to-sound mapping
-- Experiment: height (BMP ~8Pa/m), spin (mag+gyro), impact (H3LIS), squeeze (FSR)
-- Choose 2-3 primary mappings, implement in Pure Data
-- Calibration stored in flash (layout reserved)
-- MIDI discrete events: impact note triggers, FSR contact transitions
-- Decision point: if packet loss >1% in performance conditions, implement t1/t2 gap-fill
-  - Note: packet timestamp field carries RTC ticks (not true ms); interpolation must use
-    tick units. 4ms interval = 4 ticks at 993Hz TX polling.
-- **Investigate TX freeze (I2C TWI driver hang) before extended testing**
-- **Consider adding register readback verification for H3LIS CTRL_REG4 and LSM6 CTRL2_G**
-  before extended testing — silent write failures at wrong range would produce plausible but
-  incorrect sensor data.
+### Files to upload for next TX debugging session
+1. main.c (TX) — current output version
+2. sensors.c (TX) — current output version
+3. sensors.h (TX)
+4. packet_spec.h (TX)
+5. sdk_config.h (TX)
+6. project_reference.md (this file)
 
-### Phase 3: Multi-ball (3 balls simultaneous)
-- Ring buffer required in RX before running 250Hz x 3 balls (4-entry minimum)
-- BLE provisioning to assign ball_id without reflashing
-- Wire all 4 FSRs (P0.03/04/05/28)
-- Time-slot offset: Ball1=0ms, Ball2=1.33ms, Ball3=2.67ms from TIMER0 (at 250Hz)
-- Collision probability unslotted ~28% → near zero with slotting
-- BLE + proprietary radio coexistence requires design decision (SoftDevice vs timesharing)
-- C++ decoder already routes to /ball/N/ — no structural decoder changes needed
-- **Review SerialReader::MAX_QUEUE_DEPTH at transition.** Currently 500 entries = 2s at 250Hz single-ball, ~0.67s at 750Hz three-ball. Monitor GetQueueDropCount() during initial multi-ball testing.
-- **Monitor RX ISR overwrite risk.** Single rx_packet buffer is overwritten every 4ms. At 3x250Hz, the main loop has less margin between copies. Confirm usb_tx_drop_count stays near zero before moving to ring buffer phase.
-
-### Phase 4: Performance ready
-- 30+ minute stress testing
-- Battery 2+ hours
-- Physical durability: breadboard → perfboard
-- Sound design presets, rehearsal
-
----
-
-## LATENCY BUDGET
-
-| Stage | Time |
-|-------|------|
-| Sensor avg wait (250Hz loop) | ~2ms |
-| I2C read (all sensors) | ~1ms |
-| Radio TX (86 bytes @ 2Mbps) | ~0.37ms |
-| USB CDC to PC | ~1ms |
-| C++ decode | ~1ms |
-| Pure Data ASIO buffer | ~10-20ms (tunable) |
-| **Total estimated** | **~15-25ms** |
-
-Target is <20ms perceived. Achievable with ASIO4ALL tuned to 10ms buffer.
-Further reduction possible by wiring LSM6DSOX INT1 for interrupt-driven reads (Phase 3).
-
----
-
-## RISKS (updated post Phase 1.5)
-
-| Risk | Probability | Mitigation |
-|------|------------|------------|
-| BMP581 pressure fails | Resolved — was PRESS_EN bug, not hardware | |
-| TX I2C freeze after ~10-15min | Confirmed occurring | Investigate TWI driver hang (nRF52 Errata 89/121); add NVIC_SystemReset() watchdog |
-| Packet loss >1% in performance | 15% | t1/t2 gap-fill in Phase 2; RX antenna placement |
-| OSC/mrpeach setup | 20% | Test before Phase 1.5 complete; fallback MIDI patch |
-| FSR unreliable | 40% | Adjust threshold, verify 10k pulldown |
-| Multi-ball RF collision | 15% | Time-slotting planned; ring buffer required |
-| BLE + radio coexistence (Phase 3) | High | Design decision required before Phase 3 start |
-| Physical fragility | 35% | Breadboard → perfboard in Phase 3 |
-| Body occlusion (performance) | 30% | Elevate RX antenna; consider diversity RX in Phase 4 |
-
----
-
-## TROUBLESHOOTING
-
-### Decoder shows 0 bytes received
-1. Check RX RTT for "USB: port opened by host" — if absent, DTR assertion failed
-2. Confirm COM port in Device Manager (currently COM14 — auto-detect falls back to it)
-3. RX must be plugged in before boot — hot-plug not supported
-4. Only one program can own the COM port — close any serial monitors first
-
-### Decoder shows high loss with many resyncs
-If resyncs are climbing and almost no packets are accepted:
-1. Confirm sdk_config.h has APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256
-2. Confirm the define is actually compiled in: check RX RTT startup for "CDC ACM TX buf: 256 bytes"
-   (if this line is absent, the diagnostic was removed in v1.5 — add it back temporarily)
-3. Do a full Clean + Build in SES — normal rebuild does not recompile cached objects
-4. Confirm usb_serial.c frame buffer is `static uint8_t s_tx_frame[89]` not a local variable
-   (local variable = DMA reads freed stack for second USB bulk packet = garbage last 25 bytes)
-
-### Decoder shows ~20% loss with "bad ball_id 170" messages
-Cause: old RX firmware (v1.2 or v1.3 with three-write bug) — reflects in stream.
-Fix: reflash RX with v1.5 firmware.
-
-### TX freezes after ~10-15 minutes
-RTT goes silent, radio ISR stops. Most likely nrf_drv_twi blocking hang.
-Workaround: restart TX. Before restarting, note whether TX RTT is also silent
-(confirms TX-side cause vs RX radio ISR failure).
-
-### BMP581 shows 0 Pa or 130557 Pa (0x7F7F7F)
-1. Check OSR_CONFIG readback in RTT — must be 0x52 (BMP_OSR_CONFIG_VAL), not 0x12
-2. PRESS_EN (bit 6) must be set. 0x12 leaves it 0 — pressure never runs
-3. Check SDO wire to GND (fixes address at 0x46)
-4. Fit 100nF decoupling cap on VDD if not already present
-
-### BMP581 NVM error warning at startup
-Normal on Adafruit BMP581 breakouts. Confirmed on multiple units.
-Does not affect pressure output if PRESS_EN is set correctly. Not actionable.
-
-### No packets received (RX)
-1. Ensure TX is powered on and has completed init (allow 2-3s after TX boot)
-2. Disconnecting J-Link from TX triggers a reset — wait for reinit
-3. Check RF_CHANNEL = 40 on both sides
-4. Check RADIO_BASE_ADDR and RADIO_PREFIX_ADDR match exactly
-5. Packet size must be 86 bytes on both sides (packet_spec.h)
-
-### High RF packet loss (>5%)
-1. Check radio timeout count in TX status packet (2-minute RTT print)
-2. Try RF channels 20, 60, 80
-3. Keep RX elevated and forward-facing to reduce body occlusion
-
-### I2C errors accumulating
-- Verify SCL/SDA not swapped (P0.11/P0.12)
-- Verify pullups present (2.2k-4.7k to 3.3V)
-- Try 100kHz I2C if errors persist at 400kHz
-
----
-
-## KEY REMINDERS FOR NEW SESSIONS
-
-### File paths — read before generating any commands
-```
-TX SDK:   C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_tx\pca10056\blank\ses\
-RX SDK:   C:\nRF5_SDK_17.1.0\examples\proprietary_rf\juggling_ball_rx_feather\pca10056\blank\ses\
-Repo:     C:\Projects\MIDI-Juggling-Balls\
-Decoder:  C:\Projects\MIDI-Juggling-Balls\decoder\MidiJugglingDecoder\
-```
-TX is `juggling_ball_tx`. RX is `juggling_ball_rx_feather`. They differ.
-Decoder is inside the repo — files are not copied, they are edited in place.
-project_reference.md lives at docs\ inside the repo.
-Full commit routine is in the FILE LOCATIONS AND COMMIT ROUTINE section above.
-
-- **TX firmware is v3.15.** Any reference to v3.14 or earlier is obsolete.
-- **indicate_error_fatal() requires a forward declaration** at the top of main.c.
-  It is called by timing_init() and the HFCLK startup block, both of which appear
-  before its definition. Without the forward declaration, C99/C11 constraint violation.
-- **LFCLK_STARTUP_TIMEOUT_MS = 1000ms.** The LFXO (32.768kHz crystal) takes 200-600ms
-  to start. A timeout of 10ms or less will always fire and halt the device. HFXO is
-  fast (<1ms); HFCLK_STARTUP_TIMEOUT_MS = 10ms is correct.
-- **LFCLK may already be running when timing_init() is called.** nrf_drv_twi_init()
-  (called inside sensors_init()) requests LFCLK via the driver. timing_init() checks
-  LFCLKSTAT.STATE and skips the start sequence if the clock is already running —
-  clearing EVENTS_LFCLKSTARTED and reissuing TASKS_LFCLKSTART on a running clock
-  causes the event to never re-fire and the timeout to trigger.
-- **git add requires files to be inside the repo working tree.** SDK path
-  (C:\nRF5_SDK_17.1.0\...) is outside the repo. Always copy SDK → repo tx\ first,
-  then git add tx\. See commit routine in FILE LOCATIONS AND COMMIT ROUTINE.
-- **get_timestamp_ms() is now get_rtc_ticks().** Any reference to get_timestamp_ms()
-  is obsolete. The rename was made to eliminate persistent confusion in changelogs.
-- **TX_INTERVAL_TICKS (not TX_INTERVAL_MS).** The constant holds a tick count and is
-  used exclusively in tick arithmetic. The _MS suffix was renamed in v3.15 to be
-  consistent with the v3.6 rename campaign (current_time_ms, get_timestamp_ms). Any
-  reference to TX_INTERVAL_MS is obsolete.
-- **saadc_stop_and_wait() clears both EVENTS_STOPPED and EVENTS_END.** Both the normal
-  and timeout-exit paths of read_battery_voltage() use it. Do not replace it with inline
-  TASKS_STOP without also waiting for EVENTS_STOPPED — the nRF52840 SAADC requires the
-  stop to complete before TASKS_START can be issued again. EVENTS_END must also be cleared:
-  per nRF52840 PS, TASKS_STOP can generate EVENTS_END; a stale set event would cause the
-  EVENTS_END wait loop on the next call to exit immediately without a valid conversion.
-- **RX exhaustive code review is pending.** Do not assume RX code quality matches TX.
-  Same two-pass senior review process applies before Phase 2 extended testing.
-- **TX v3.15 is the version to use.** main.c and sensors.c are in repo tx\ and SDK ses\.
-
-- **radio_init() readback covers: MODE, FREQUENCY, PCNF1.STATLEN, BASE0, PREFIX0, CRCPOLY, CRCINIT.** PREFIX0 was added in v3.10. A mismatch on any of these produces a silent dead link.
-- **Phase 3 fsr_read SAADC: MAXCNT=5, discard adc_values[0] (battery, CH0).** FSR0..FSR3 are in adc_values[1..4]. Do not revert to MAXCNT=4.
-- **On-air packet size: 86 bytes. USB frame: 89 bytes (sync + payload + checksum).**
-- **USB framing constants are in packet_spec.h.** USB_SYNC_BYTE_0 (0xAA), USB_SYNC_BYTE_1 (0x55), USB_FRAME_SIZE (89). Do not redefine locally in usb_serial.c, main.c (RX), or SerialReader.cpp.
-- **packet_spec.h must be identical in tx\ and rx\.** Run fc to verify before committing.
-- **sdk_config.h is version-controlled** and must be committed with firmware changes.
-- **APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE = 256** in sdk_config.h. Default 64 is too small.
-- **usb_serial frame buffer is static.** Do not change it back to a local variable — DMA reads it after the function returns (second USB bulk packet fires after function exit).
-- **usb_serial_send_text() checks s_tx_busy.** Both send paths share the USB endpoint; overlapping writes corrupt the transfer.
-- **RX LFCLK via nrf_drv_clock_lfclk_request(), not direct registers.** Direct writes bypass driver reference counting and can cause RTC1 to stop if the USB stack releases LFCLK.
-- **BMP581 OSR_CONFIG must be 0x52 (BMP_OSR_CONFIG_VAL).** Bit 6 = PRESS_EN. 0x12 = pressure disabled.
-- **BMP581 NVM error is normal.** Observed on all tested Adafruit units. Not a fault.
-- **BMP581 needs 100nF decoupling cap on VDD.** Required for reliable power-on.
-- **BMP581: pa = raw/64.** On-chip compensation. No NVM, no polynomial.
-- **LIS3MDL CTRL_REG1 = 0xFE (LIS3_CTRL_REG1_VAL, 155Hz, FAST_ODR=1).** Previous value 0xFC = 80Hz. Burst read needs | 0x80. LSM6DSOX does not. H3LIS331 also needs | 0x80.
-- **LSM6 CTRL2_G = 0x64 (LSM6_CTRL2_G_VAL, +/-500dps).** 0x68 = +/-1000dps. This was a silent multi-session bug. Use the named constant.
-- **Gyro is +/-500dps.** Decoder and Pure Data must use this for scaling.
-- **H3LIS is +/-400g.** Do not confuse with LSM6 +/-16g scale.
-- **H3LIS decode: use extract_h3lis_axis().** Do not use arithmetic right shift.
-- **Sensor config values are named constants in sensors.c** (LSM6_CTRL1_XL_VAL, LSM6_CTRL2_G_VAL, etc.). Use these when modifying ODR or range. Do not reconstruct bytes manually.
-- **Packet timestamp field carries RTC ticks, not true milliseconds.** RTC1 runs at 993Hz; each tick = ~1.007ms. For Phase 2 gap-fill interpolation, treat as ticks. Counter wraps at ~66.0s.
-- **get_uptime_seconds() divides by RTC1_TICKS_PER_SEC = 993**, not 1000. The old divide-by-1000 made uptime run 0.71% fast. If you see this constant changed back to 1000, revert it.
-- **runtime_sensor_status SENSOR_LSM6_OK clears on any single I2C read failure** during sensors_read(). A transient blip appears as "sensor failed" in the status packet. This is normal — correlate with i2c_errors count.
-- **H3LIS and LSM6 register init is not readback-verified** (unlike radio_init and BMP581, which now both validate readbacks). Plan to add before Phase 2 extended testing.
-- **OSC is primary protocol.** MIDI only for discrete events.
-- **USB init is non-fatal on RX.** RTT validation works without USB.
-- **TX does not need J-Link to transmit.** USB power is sufficient after flashing.
-- **Disconnecting J-Link from TX resets it.** Allow 2-3s reinit before expecting packets on RX.
-- **Decoder auto-detects COM14** via SERIALCOMM fallback. No argument needed if only one COM port active.
-- **Decoder requires DTR assertion.** SerialReader.cpp calls EscapeCommFunction(SETDTR).
-- **USB single-write is mandatory.** Three separate writes corrupt the stream on TX buffer busy.
-- **CDC ACM TX buffer must be 256 bytes.** Set in sdk_config.h, requires Clean+Build in SES.
-- **SerialReader queue drops (GetQueueDropCount) should be zero** during single-ball operation. Non-zero at Phase 3 multi-ball means consumer loop cannot keep up — review MAX_QUEUE_DEPTH and Sleep(1) budget.
-- **Decoder resync_events counts misaligned bytes, not dropped packets.** A single bad burst at startup can produce hundreds of resync_events with zero packet loss. Only worry if resyncs are non-zero in steady state.
-- **Decoder Ctrl+C exits cleanly** via g_running flag and console control handler. SerialReader destructor runs and joins the reader thread. If you replace the main loop structure, preserve this — without it the COM port may not release until the process is killed.
-- **DecodedPacket::timestamp_ticks** — field was previously named timestamp_ms. It carries RTC ticks, not milliseconds. Any OSC sender or logging code built on top must use ticks units for interpolation.
-- **CRC_POLYNOMIAL = 0x00065B is Nordic nRF proprietary CRC-24**, not IBM CRC-24 (0x864CFB). If implementing an independent CRC checker (e.g. Python analysis script), use 0x00065B with init 0x555555. Searching "IBM CRC-24" gives the wrong polynomial.
-- **SDK not in git.** nRF5 SDK v17.1.0, download separately from Nordic.
-- **SES .emProject not in git.** Contains absolute paths, machine-specific.
-- **VS2019 .sln and .vcxproj ARE in git.** These are safe to commit (no absolute paths).
+RX files are NOT needed unless RX behaviour changes.

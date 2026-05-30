@@ -3112,39 +3112,102 @@
 // </h> 
 //==========================================================
 
-
-// <h> segger_rtt - SEGGER RTT
-//==========================================================
-// <o> SEGGER_RTT_CONFIG_BUFFER_SIZE_UP - Size of upstream buffer (target to host).
-#ifndef SEGGER_RTT_CONFIG_BUFFER_SIZE_UP
-#define SEGGER_RTT_CONFIG_BUFFER_SIZE_UP 512
+// ============================================================================
+// USB CDC ACM TX buffer size
+//
+// APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE controls the size of the internal
+// endpoint IN buffer used by app_usbd_cdc_acm_write(). The SDK default is
+// 64 bytes, which is also the USB full-speed bulk endpoint max packet size.
+//
+// usb_serial_send_framed_packet() sends 89-byte frames (2 sync + 86 payload
+// + 1 checksum) in a single app_usbd_cdc_acm_write() call. With the default
+// 64-byte buffer the write is rejected or truncated: the PC decoder receives
+// malformed frames and cannot lock sync, producing ~99% apparent packet loss.
+//
+// 256 bytes is sufficient for the current 89-byte frame with headroom for
+// future growth (Phase 3 multi-ball does not change the frame size).
+// Must be a power of 2 per SDK requirements.
+// ============================================================================
+#ifndef APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE
+#define APP_USBD_CDC_ACM_DATA_EPIN_BUFF_SIZE 256
 #endif
 
-// <o> SEGGER_RTT_CONFIG_MAX_NUM_UP_BUFFERS - Maximum number of upstream buffers.
-#ifndef SEGGER_RTT_CONFIG_MAX_NUM_UP_BUFFERS
-#define SEGGER_RTT_CONFIG_MAX_NUM_UP_BUFFERS 2
+// ============================================================================
+// TWI/TWIM peripheral enable
+//
+// TWI0_USE_EASY_DMA=1 routes nrf_drv_twi to the TWIM peripheral (EasyDMA),
+// which is required for non-blocking mode (event handler != NULL in
+// nrf_drv_twi_init). Without this the SDK silently uses the legacy blocking
+// TWI backend -- the twi_event_handler in sensors.c is never called and every
+// transaction blocks forever on a peripheral hang (Errata 89/121).
+//
+// All DMA source/destination buffers in sensors.c are in RAM (module-level
+// statics or stack locals within the calling frame), satisfying the TWIM
+// EasyDMA RAM-only requirement.
+// ============================================================================
+
+#ifndef TWI_ENABLED
+#define TWI_ENABLED 1
 #endif
 
-// <o> SEGGER_RTT_CONFIG_BUFFER_SIZE_DOWN - Size of downstream buffer (host to target).
-#ifndef SEGGER_RTT_CONFIG_BUFFER_SIZE_DOWN
-#define SEGGER_RTT_CONFIG_BUFFER_SIZE_DOWN 16
+#ifndef TWI0_USE_EASY_DMA
+#define TWI0_USE_EASY_DMA 1
 #endif
 
-// <o> SEGGER_RTT_CONFIG_MAX_NUM_DOWN_BUFFERS - Maximum number of downstream buffers.
-#ifndef SEGGER_RTT_CONFIG_MAX_NUM_DOWN_BUFFERS
-#define SEGGER_RTT_CONFIG_MAX_NUM_DOWN_BUFFERS 2
+#ifndef TWIM_ENABLED
+#define TWIM_ENABLED 1
 #endif
 
-// <o> SEGGER_RTT_CONFIG_DEFAULT_MODE - RTT transfer mode for buffer 0.
-// <0=> SKIP  - Drop data if buffer full. Non-blocking. Correct for real-time loop.
-// <1=> TRIM  - Write as much as fits, drop remainder.
-// <2=> BLOCK_IF_FIFO_FULL - Block until host reads. Will stall main loop if no viewer attached.
-// Set to 0 (SKIP): TX loop must not block on RTT when J-Link viewer is absent.
+// ============================================================================
+// SEGGER RTT configuration
+//
+// SEGGER_RTT_CONFIG_DEFAULT_MODE controls what SEGGER_RTT_printf does when
+// the up-buffer is full and no J-Link is connected to drain it.
+//
+// 0 = SEGGER_RTT_MODE_NO_BLOCK_SKIP      -- drop the write, return immediately
+// 1 = SEGGER_RTT_MODE_NO_BLOCK_TRIM      -- write as much as fits, drop rest
+// 2 = SEGGER_RTT_MODE_BLOCK_IF_FIFO_FULL -- spin until space is available
+//
+// Mode 2 is the library default in some SDK configurations. Without J-Link
+// connected the up-buffer fills within seconds at TX print volume (~200
+// bytes/s). In mode 2, SEGGER_RTT_printf then spins indefinitely. The WDT
+// fires after 500ms, resets TX, which immediately tries to print the boot
+// banner, blocks again, WDT fires again -- TX never reaches the transmit loop.
+// This is the root cause of the "fails without J-Link, works with J-Link"
+// dropout pattern. J-Link continuously drains the buffer, preventing the stall.
+//
+// Mode 0 is correct for any target that runs without a debugger attached.
+// RTT writes are silently dropped when the buffer is full; TX keeps running.
+//
+// DO NOT CHANGE THIS TO 1 OR 2. The RX sdk_config.h carries the same setting
+// and the same warning -- both projects must match.
+// ============================================================================
 #ifndef SEGGER_RTT_CONFIG_DEFAULT_MODE
-#define SEGGER_RTT_CONFIG_DEFAULT_MODE 0
+#define SEGGER_RTT_CONFIG_DEFAULT_MODE    0
 #endif
-// </h>
-//==========================================================
+
+// ============================================================================
+// LFCLK source
+//
+// CLOCK_CONFIG_LF_SRC = 1 selects the 32.768kHz crystal (LFXO) as the low-
+// frequency clock source. Without this, the SDK clock module defaults to the
+// RC oscillator (LFRC, ±500ppm), which would make all timing constants that
+// depend on a 32768Hz crystal incorrect.
+//
+// TX note: timing_init() in main.c manages the LFCLK directly via peripheral
+// registers (NRF_CLOCK->LFCLKSRC = Xtal, TASKS_LFCLKSTART), bypassing the SDK
+// clock module entirely for the RTC1 use case. The TWI driver (called earlier,
+// inside sensors_init()) starts LFCLK via the SDK clock module before timing_init()
+// runs. timing_init() unconditionally stops and restarts LFCLK as Xtal, so any
+// SDK-selected RC source is overridden. CLOCK_CONFIG_LF_SRC = 1 makes the SDK's
+// initial selection correct and removes the dependency on timing_init()'s
+// override being reached before any timing-sensitive code runs.
+//
+// RX sdk_config.h carries the same setting -- both projects must match.
+// ============================================================================
+#ifndef CLOCK_CONFIG_LF_SRC
+#define CLOCK_CONFIG_LF_SRC 1
+#endif
 
 // <<< end of configuration section >>>
 #endif //SDK_CONFIG_H
